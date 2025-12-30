@@ -4,7 +4,7 @@ mod limits;
 
 pub use error::Error;
 pub use limits::Limits;
-pub use extractor::{Extractor, OverwritePolicy, SymlinkPolicy, Report, EntryInfo};
+pub use extractor::{Extractor, OverwritePolicy, SymlinkPolicy, ExtractionMode, Report, EntryInfo};
 
 /// Convenience function to extract a zip file with default settings.
 pub fn extract_file<P: AsRef<std::path::Path>, F: AsRef<std::path::Path>>(

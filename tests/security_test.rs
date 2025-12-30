@@ -1,4 +1,4 @@
-use safe_unzip::{Extractor, Error};
+use safe_unzip::{Extractor, Error, ExtractionMode};
 use std::io::{Write, Seek};
 use tempfile::{tempdir, NamedTempFile};
 use zip::write::FileOptions;
@@ -111,4 +111,48 @@ fn test_extract_file_method() {
     assert_eq!(content, "Hello, World!");
     
     println!("✅ extract_file() works correctly");
+}
+
+#[test]
+fn test_validate_first_no_partial_state() {
+    // Create a zip with:
+    // 1. A valid file FIRST
+    // 2. A malicious file SECOND
+    // In Streaming mode, the first file would be written before failing.
+    // In ValidateFirst mode, NOTHING should be written.
+    
+    let file = tempfile::tempfile().unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: FileOptions<()> = FileOptions::default();
+    
+    // First: a valid file
+    zip.start_file("good.txt", options.clone()).unwrap();
+    zip.write_all(b"This is fine").unwrap();
+    
+    // Second: a malicious file (Zip Slip attack)
+    zip.start_file("../../evil.txt", options).unwrap();
+    zip.write_all(b"pwned").unwrap();
+    
+    let zip_file = zip.finish().unwrap();
+
+    let dest = tempdir().unwrap();
+    
+    // Use ValidateFirst mode
+    let result = Extractor::new(dest.path())
+        .unwrap()
+        .mode(ExtractionMode::ValidateFirst)
+        .extract(zip_file);
+
+    // Should fail with PathEscape
+    assert!(matches!(result, Err(Error::PathEscape { .. })));
+    
+    // THE KEY ASSERTION: Nothing should be written!
+    // In Streaming mode, "good.txt" would exist. In ValidateFirst, it shouldn't.
+    let good_path = dest.path().join("good.txt");
+    assert!(
+        !good_path.exists(),
+        "❌ ValidateFirst FAIL: good.txt was written before validation completed!"
+    );
+    
+    println!("✅ ValidateFirst prevented partial extraction");
 }

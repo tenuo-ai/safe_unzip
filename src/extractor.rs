@@ -21,6 +21,17 @@ pub enum SymlinkPolicy {
     Error,
 }
 
+/// Extraction strategy.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ExtractionMode {
+    /// Extract immediately. Partial state on failure.
+    #[default]
+    Streaming,
+    /// Validate all entries first, then extract.
+    /// Slower (2x iteration) but no partial state on validation failure.
+    ValidateFirst,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub files_extracted: usize,
@@ -42,6 +53,7 @@ pub struct Extractor {
     limits: Limits,
     overwrite: OverwritePolicy,
     symlinks: SymlinkPolicy,
+    mode: ExtractionMode,
     // Using a boxed closure for the filter
     filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
 }
@@ -61,6 +73,7 @@ impl Extractor {
             limits: Limits::default(),
             overwrite: OverwritePolicy::default(),
             symlinks: SymlinkPolicy::default(),
+            mode: ExtractionMode::default(),
             filter: None,
         })
     }
@@ -80,6 +93,11 @@ impl Extractor {
         self
     }
 
+    pub fn mode(mut self, mode: ExtractionMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: Fn(&EntryInfo) -> bool + Send + Sync + 'static,
@@ -90,6 +108,12 @@ impl Extractor {
 
     pub fn extract<R: Read + Seek>(&self, reader: R) -> Result<Report, Error> {
         let mut archive = zip::ZipArchive::new(reader)?;
+        
+        // If ValidateFirst mode, do a dry run first
+        if matches!(self.mode, ExtractionMode::ValidateFirst) {
+            self.validate_all(&mut archive)?;
+        }
+        
         let mut report = Report::default();
         let mut total_bytes_written: u64 = 0;
 
@@ -212,6 +236,74 @@ impl Extractor {
         }
 
         Ok(report)
+    }
+
+    /// Validate all entries without extracting (fast dry run).
+    /// Uses `by_index_raw()` to read metadata without decompressing.
+    fn validate_all<R: Read + Seek>(&self, archive: &mut zip::ZipArchive<R>) -> Result<(), Error> {
+        let mut total_size: u64 = 0;
+        let mut file_count: usize = 0;
+
+        for i in 0..archive.len() {
+            // by_index_raw reads metadata WITHOUT decompressing
+            let entry = archive.by_index_raw(i)?;
+            let name = entry.name().to_string();
+
+            // 1. Path validation (Zip Slip check)
+            self.jail.join(&name).map_err(|e| Error::PathEscape {
+                entry: name.clone(),
+                detail: e.to_string(),
+            })?;
+
+            // 2. Symlink check
+            if entry.is_symlink() && matches!(self.symlinks, SymlinkPolicy::Error) {
+                return Err(Error::SymlinkNotAllowed { entry: name });
+            }
+
+            // 3. Path depth check
+            let depth = Path::new(&name)
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count();
+            if depth > self.limits.max_path_depth {
+                return Err(Error::PathTooDeep {
+                    entry: name,
+                    depth,
+                    limit: self.limits.max_path_depth,
+                });
+            }
+
+            // 4. Single file size check
+            if !entry.is_dir() && entry.size() > self.limits.max_single_file {
+                return Err(Error::FileTooLarge {
+                    entry: name,
+                    limit: self.limits.max_single_file,
+                    size: entry.size(),
+                });
+            }
+
+            // Accumulate totals (skip symlinks and dirs)
+            if !entry.is_dir() && !entry.is_symlink() {
+                total_size += entry.size();
+                file_count += 1;
+            }
+        }
+
+        // 5. Check accumulated totals
+        if total_size > self.limits.max_total_bytes {
+            return Err(Error::TotalSizeExceeded {
+                limit: self.limits.max_total_bytes,
+                would_be: total_size,
+            });
+        }
+
+        if file_count > self.limits.max_file_count {
+            return Err(Error::FileCountExceeded {
+                limit: self.limits.max_file_count,
+            });
+        }
+
+        Ok(())
     }
 
     /// Extract from a file path. Convenience wrapper around `extract()`.
