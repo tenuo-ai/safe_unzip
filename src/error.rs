@@ -12,13 +12,20 @@ pub enum Error {
     TotalSizeExceeded { limit: u64, would_be: u64 },
 
     /// Exceeded maximum file count.
-    FileCountExceeded { limit: usize },
+    FileCountExceeded { limit: usize, attempted: usize },
 
     /// Single file exceeds size limit.
     FileTooLarge {
         entry: String,
         limit: u64,
         size: u64,
+    },
+
+    /// Actual decompressed size exceeds declared size (potential zip bomb).
+    SizeMismatch {
+        entry: String,
+        declared: u64,
+        actual: u64,
     },
 
     /// Path exceeds depth limit.
@@ -35,7 +42,7 @@ pub enum Error {
     DestinationNotFound { path: String },
 
     /// Filename contains invalid characters or reserved names.
-    InvalidFilename { entry: String },
+    InvalidFilename { entry: String, reason: String },
 
     /// Zip format error.
     Zip(zip::result::ZipError),
@@ -47,39 +54,84 @@ pub enum Error {
     Jail(path_jail::JailError),
 }
 
+/// Format bytes in human-readable form (e.g., "1.5 GB").
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PathEscape { entry, detail } => {
-                write!(f, "security error: path '{}' escapes jail: {}", entry, detail)
+                write!(f, "path '{}' escapes destination: {}", entry, detail)
             }
             Self::SymlinkNotAllowed { entry } => {
-                write!(f, "security error: symlink not allowed: '{}'", entry)
+                write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
             }
             Self::TotalSizeExceeded { limit, would_be } => {
-                write!(f, "quota error: total size {} bytes exceeds limit {}", would_be, limit)
+                write!(
+                    f, 
+                    "extraction would write {}, exceeding the {} limit",
+                    format_bytes(*would_be),
+                    format_bytes(*limit)
+                )
             }
-            Self::FileCountExceeded { limit } => {
-                write!(f, "quota error: file count exceeds limit {}", limit)
+            Self::FileCountExceeded { limit, attempted } => {
+                write!(
+                    f, 
+                    "archive contains {} files, exceeding the {} file limit",
+                    attempted, limit
+                )
             }
             Self::FileTooLarge { entry, limit, size } => {
-                write!(f, "quota error: entry '{}' size {} exceeds limit {}", entry, size, limit)
+                write!(
+                    f, 
+                    "file '{}' is {} (limit: {})",
+                    entry,
+                    format_bytes(*size),
+                    format_bytes(*limit)
+                )
+            }
+            Self::SizeMismatch { entry, declared, actual } => {
+                write!(
+                    f,
+                    "file '{}' decompressed to {} but declared {} (possible zip bomb)",
+                    entry,
+                    format_bytes(*actual),
+                    format_bytes(*declared)
+                )
             }
             Self::PathTooDeep { entry, depth, limit } => {
-                write!(f, "quota error: entry '{}' depth {} exceeds limit {}", entry, depth, limit)
+                write!(
+                    f, 
+                    "path '{}' has {} directory levels (limit: {})",
+                    entry, depth, limit
+                )
             }
             Self::AlreadyExists { path } => {
-                write!(f, "file already exists: '{}'", path)
+                write!(f, "file '{}' already exists", path)
             }
             Self::DestinationNotFound { path } => {
-                write!(f, "destination directory not found: '{}'", path)
+                write!(f, "destination directory '{}' does not exist", path)
             }
-            Self::InvalidFilename { entry } => {
-                write!(f, "security error: invalid filename: '{}'", entry)
+            Self::InvalidFilename { entry, reason } => {
+                write!(f, "invalid filename '{}': {}", entry, reason)
             }
-            Self::Zip(e) => write!(f, "zip error: {}", e),
-            Self::Io(e) => write!(f, "io error: {}", e),
-            Self::Jail(e) => write!(f, "jail error: {}", e),
+            Self::Zip(e) => write!(f, "zip format error: {}", e),
+            Self::Io(e) => write!(f, "I/O error: {}", e),
+            Self::Jail(e) => write!(f, "path validation error: {}", e),
         }
     }
 }

@@ -366,7 +366,7 @@ fn test_file_count_limit() {
         })
         .extract(zip);
     
-    assert!(matches!(result, Err(Error::FileCountExceeded { limit: 3 })));
+    assert!(matches!(result, Err(Error::FileCountExceeded { limit: 3, .. })));
     
     println!("✅ File count limit works");
 }
@@ -444,9 +444,10 @@ fn test_sanitize_filenames() {
     let result = Extractor::new(dest.path()).unwrap().extract(zip);
     
     match result {
-        Err(Error::InvalidFilename { entry }) => {
+        Err(Error::InvalidFilename { entry, reason }) => {
             assert_eq!(entry, "CON.txt");
-            println!("✅ Successfully rejected reserved filename: {}", entry);
+            assert!(reason.contains("reserved"), "reason should mention reserved: {}", reason);
+            println!("✅ Successfully rejected '{}': {}", entry, reason);
         }
         _ => panic!("❌ Failed to reject reserved filename"),
     }
@@ -589,4 +590,179 @@ fn test_strict_size_enforcement() {
         }
         _ => panic!("❌ Failed to enforce declared size: {:?}", result),
     }
+}
+
+// ============================================================================
+// Advanced Attack Vector Tests
+// ============================================================================
+
+/// Test: Absolute paths in zip entries should be blocked or safely contained
+/// Attack: Archive contains "/tmp/evil.txt" or "C:\evil.txt" 
+/// Defense: path_jail should reject or strip the root
+#[test]
+fn test_absolute_path_rejection() {
+    let dest = tempdir().unwrap();
+    
+    // Create zip with absolute path entry
+    #[cfg(unix)]
+    let zip = create_simple_zip("/tmp/evil.txt", b"evil");
+    #[cfg(windows)]
+    let zip = create_simple_zip("C:\\evil.txt", b"evil");
+    
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+    
+    match result {
+        Err(Error::PathEscape { .. }) => {
+            println!("✅ Blocked absolute path via PathEscape");
+        }
+        Err(Error::InvalidFilename { .. }) => {
+            // Backslash rejection on Windows path
+            println!("✅ Blocked absolute path via InvalidFilename");
+        }
+        Ok(_) => {
+            // If it succeeded, ensure it didn't write outside the jail
+            #[cfg(unix)]
+            assert!(!std::path::Path::new("/tmp/evil.txt").exists(), 
+                "❌ Wrote to absolute path outside jail!");
+            // It should be inside the jail (with root stripped)
+            let inside = dest.path().join("tmp/evil.txt").exists() 
+                || dest.path().join("evil.txt").exists();
+            assert!(inside, "File should be inside jail");
+            println!("✅ Absolute path stripped and contained in jail");
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Backslash in filename should be rejected
+/// Attack: "folder\file.txt" or "..\secret.txt" on Windows
+/// Defense: is_valid_filename rejects backslashes
+#[test]
+fn test_backslash_rejection() {
+    let dest = tempdir().unwrap();
+    
+    // This tests that backslash rejection happens in filename validation,
+    // not later in path processing
+    let zip = create_simple_zip("folder\\file.txt", b"data");
+    
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+    
+    match result {
+        Err(Error::InvalidFilename { entry, reason }) => {
+            assert!(reason.contains("backslash"), "Should mention backslash: {}", reason);
+            println!("✅ Rejected backslash in filename '{}': {}", entry, reason);
+        }
+        _ => panic!("❌ Should reject backslash in filename: {:?}", result),
+    }
+}
+
+/// Test: Null byte in filename should be rejected
+/// Attack: "image.png\0.exe" - OS might truncate at null
+/// Defense: is_valid_filename rejects control characters
+#[test]
+fn test_null_byte_rejection() {
+    let dest = tempdir().unwrap();
+    
+    // Filename with embedded null byte
+    let zip = create_simple_zip("harmless.txt\0.exe", b"malware");
+    
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+    
+    match result {
+        Err(Error::InvalidFilename { entry, reason }) => {
+            assert!(reason.contains("control"), "Should mention control chars: {}", reason);
+            println!("✅ Rejected null byte in filename '{}': {}", entry, reason);
+        }
+        _ => panic!("❌ Should reject null byte in filename: {:?}", result),
+    }
+}
+
+/// Test: Empty filename should be rejected
+/// Attack: Entry with empty name could confuse path joining
+/// Defense: is_valid_filename rejects empty names
+#[test]
+fn test_empty_filename_rejection() {
+    let dest = tempdir().unwrap();
+    
+    let zip = create_simple_zip("", b"data");
+    
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+    
+    match result {
+        Err(Error::InvalidFilename { reason, .. }) => {
+            assert!(reason.contains("empty"), "Should mention empty: {}", reason);
+            println!("✅ Rejected empty filename: {}", reason);
+        }
+        _ => panic!("❌ Should reject empty filename: {:?}", result),
+    }
+}
+
+/// Test: Symlink followed by file with same name
+/// Attack: Archive has symlink "link -> /etc/passwd", then file "link" with content
+/// Defense: When overwriting, remove symlink before creating file
+#[test]
+#[cfg(unix)]
+fn test_symlink_then_file_in_same_archive() {
+    use std::os::unix::fs::symlink;
+    
+    let dest = tempdir().unwrap();
+    
+    // Create a scenario where the ARCHIVE tries to create a symlink,
+    // then overwrite it with a file. 
+    // Since we skip symlinks by default, let's test with Overwrite policy
+    // by pre-creating a symlink at the destination.
+    
+    // Step 1: Pre-create a symlink in destination that points outside
+    let link_path = dest.path().join("link");
+    let target_file = dest.path().join("target.txt");
+    std::fs::write(&target_file, "original").unwrap();
+    symlink("target.txt", &link_path).unwrap();
+    
+    // Verify symlink works
+    assert!(link_path.is_symlink());
+    assert_eq!(std::fs::read_to_string(&link_path).unwrap(), "original");
+    
+    // Step 2: Create zip that writes to "link"
+    let zip = create_simple_zip("link", b"overwritten");
+    
+    // Step 3: Extract with Overwrite policy
+    let result = Extractor::new(dest.path())
+        .unwrap()
+        .overwrite(OverwritePolicy::Overwrite)
+        .extract(zip);
+    
+    // Step 4: Verify the symlink was replaced with a file
+    assert!(result.is_ok(), "Should succeed: {:?}", result);
+    
+    // The path should now be a regular file, NOT a symlink
+    assert!(!link_path.is_symlink(), "Should no longer be a symlink");
+    assert!(link_path.is_file(), "Should be a regular file");
+    
+    // Content should be the new content, not overwriting through the symlink
+    let content = std::fs::read_to_string(&link_path).unwrap();
+    assert_eq!(content, "overwritten", "File should have new content");
+    
+    // The original target should be unchanged (symlink was removed, not followed)
+    let target_content = std::fs::read_to_string(&target_file).unwrap();
+    assert_eq!(target_content, "original", "Original target should be unchanged");
+    
+    println!("✅ Symlink replaced with file safely (didn't follow symlink)");
+}
+
+/// Test: Traversal using backslash on Windows-style paths
+/// Attack: "..\\..\secret.txt" mixing slashes
+/// Defense: Reject backslash before any path processing
+#[test]
+fn test_mixed_slash_traversal() {
+    let dest = tempdir().unwrap();
+    
+    // Mix forward and back slashes with traversal
+    let zip = create_simple_zip("foo\\..\\bar.txt", b"data");
+    
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+    
+    // Should be caught by backslash rejection
+    assert!(matches!(result, Err(Error::InvalidFilename { .. })), 
+        "Should reject mixed slashes: {:?}", result);
+    println!("✅ Rejected mixed slash traversal attempt");
 }

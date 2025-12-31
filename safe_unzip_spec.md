@@ -20,9 +20,13 @@ Built on `path_jail` for path validation.
 | Zip Bomb (size) | 42KB expands to 4PB | `max_total_bytes` limit |
 | Zip Bomb (count) | 1 million empty files | `max_file_count` limit |
 | Zip Bomb (ratio) | Single file with extreme compression | `max_single_file` limit |
+| Zip Bomb (lying) | Declared 1KB, decompresses to 1GB | `LimitReader` enforces during read |
 | Symlink Escape | Symlink to `/etc/passwd` | Skip or error on symlinks |
+| Symlink Overwrite | Create symlink, then overwrite its target | Remove symlinks before overwrite |
 | Path Depth | `a/b/c/d/.../` to 10000 levels | `max_path_depth` limit |
+| Invalid Filename | Control chars, `CON`, `NUL`, backslashes | Filename sanitization |
 | Overwrite | Replace existing sensitive file | `OverwritePolicy::Error` default |
+| Setuid Escalation | Archive creates setuid binaries | Permission bits stripped |
 
 ## 3. Scope
 
@@ -116,14 +120,29 @@ pub enum SymlinkPolicy {
 }
 
 /// Extraction strategy.
+///
+/// # Tradeoffs
+///
+/// | Mode | Speed | On Failure | Use When |
+/// |------|-------|------------|----------|
+/// | `Streaming` | Fast (1 pass) | Partial files remain | Speed matters; you'll clean up on error |
+/// | `ValidateFirst` | Slower (2 passes) | No files if validation fails | Can't tolerate partial state |
+///
+/// **Neither mode is truly atomic.** If extraction fails mid-write (e.g., disk full),
+/// partial files remain regardless of mode. `ValidateFirst` only prevents writes when
+/// *validation* fails (bad paths, limits exceeded), not when I/O fails during extraction.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ExtractionMode {
-    /// Extract immediately. Partial state on failure.
+    /// Extract entries as they are read. Fast but leaves partial state on failure.
+    /// 
+    /// Tradeoff: If extraction fails on entry N, entries 1..N-1 remain on disk.
     #[default]
     Streaming,
     
-    /// Validate all entries first, then extract.
-    /// Slower (2x iteration) but no partial state on validation failure.
+    /// Validate all entries first, then extract. Slower but no partial state on validation failure.
+    /// 
+    /// Tradeoff: 2x slower (iterates archive twice). Still not atomic for I/O failures.
+    /// Note: Filter callbacks are NOT applied during validation—limits are checked against ALL entries.
     ValidateFirst,
 }
 
@@ -167,8 +186,17 @@ pub struct Report {
 ```rust
 impl Extractor {
     /// Create extractor for the given destination directory.
-    /// Directory must exist.
+    /// Returns Error::DestinationNotFound if directory doesn't exist.
+    /// 
+    /// Security: Requiring the destination to exist catches typos like
+    /// `/var/uplaods` that would otherwise silently create a wrong directory.
     pub fn new<P: AsRef<Path>>(destination: P) -> Result<Self, Error>;
+    
+    /// Create extractor, creating the destination directory if it doesn't exist.
+    /// 
+    /// Convenience method for "just works" behavior. Be careful with user-provided
+    /// paths—typos will silently create wrong directories.
+    pub fn new_or_create<P: AsRef<Path>>(destination: P) -> Result<Self, Error>;
     
     /// Set resource limits.
     pub fn limits(self, limits: Limits) -> Self;
@@ -206,27 +234,36 @@ impl Default for Limits {
 }
 ```
 
-### 5.3 Convenience Function
+### 5.3 Convenience Functions
+
+These are the "just works" API. They create the destination directory if it doesn't exist.
 
 ```rust
-/// Extract a zip file with default settings.
+/// Extract from a reader with default settings.
+/// Creates destination directory if it doesn't exist.
 pub fn extract<P, R>(destination: P, reader: R) -> Result<Report, Error>
 where
     P: AsRef<Path>,
     R: Read + Seek,
 {
-    Extractor::new(destination)?.extract(reader)
+    Extractor::new_or_create(destination)?.extract(reader)
 }
 
-/// Extract a zip file from a path with default settings.
+/// Extract from a file path with default settings.
+/// Creates destination directory if it doesn't exist.
 pub fn extract_file<D, F>(destination: D, file: F) -> Result<Report, Error>
 where
     D: AsRef<Path>,
     F: AsRef<Path>,
 {
-    Extractor::new(destination)?.extract_file(file)
+    Extractor::new_or_create(destination)?.extract_file(file)
 }
 ```
+
+**Note:** The convenience functions use `new_or_create`, while the `Extractor` builder uses
+`new` (which requires the destination to exist). This is intentional:
+- Convenience API: "just works" for quick scripts
+- Builder API: explicit control for production code where typos should fail
 
 ### 5.4 Error Type
 
@@ -253,6 +290,7 @@ pub enum Error {
     /// Exceeded maximum file count.
     FileCountExceeded {
         limit: usize,
+        attempted: usize,
     },
     
     /// Single file exceeds size limit.
@@ -260,6 +298,13 @@ pub enum Error {
         entry: String,
         limit: u64,
         size: u64,
+    },
+    
+    /// Actual decompressed size exceeds declared size (potential zip bomb).
+    SizeMismatch {
+        entry: String,
+        declared: u64,
+        actual: u64,
     },
     
     /// Path exceeds depth limit.
@@ -274,8 +319,8 @@ pub enum Error {
         path: String,
     },
     
-    /// Invalid entry name.
-    InvalidEntry {
+    /// Filename contains invalid characters or reserved names.
+    InvalidFilename {
         entry: String,
         reason: String,
     },
@@ -299,35 +344,39 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PathEscape { entry, detail } => {
-                write!(f, "path escape in '{}': {}", entry, detail)
+                write!(f, "path '{}' escapes destination: {}", entry, detail)
             }
             Self::SymlinkNotAllowed { entry } => {
-                write!(f, "symlink not allowed: '{}'", entry)
+                write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
             }
             Self::TotalSizeExceeded { limit, would_be } => {
-                write!(f, "total size {} exceeds limit {}", would_be, limit)
+                write!(f, "extraction would write {} bytes, exceeding {} limit", would_be, limit)
             }
-            Self::FileCountExceeded { limit } => {
-                write!(f, "file count exceeds limit {}", limit)
+            Self::FileCountExceeded { limit, attempted } => {
+                write!(f, "archive contains {} files, exceeding {} limit", attempted, limit)
             }
             Self::FileTooLarge { entry, limit, size } => {
-                write!(f, "'{}' size {} exceeds limit {}", entry, size, limit)
+                write!(f, "file '{}' is {} bytes (limit: {})", entry, size, limit)
+            }
+            Self::SizeMismatch { entry, declared, actual } => {
+                write!(f, "file '{}' decompressed to {} bytes but declared {} (possible zip bomb)", 
+                    entry, actual, declared)
             }
             Self::PathTooDeep { entry, depth, limit } => {
-                write!(f, "'{}' depth {} exceeds limit {}", entry, depth, limit)
+                write!(f, "path '{}' has {} directory levels (limit: {})", entry, depth, limit)
             }
             Self::AlreadyExists { path } => {
-                write!(f, "file already exists: '{}'", path)
+                write!(f, "file '{}' already exists", path)
             }
-            Self::InvalidEntry { entry, reason } => {
-                write!(f, "invalid entry '{}': {}", entry, reason)
+            Self::InvalidFilename { entry, reason } => {
+                write!(f, "invalid filename '{}': {}", entry, reason)
             }
             Self::DestinationNotFound { path } => {
-                write!(f, "destination not found: '{}'", path)
+                write!(f, "destination directory '{}' does not exist", path)
             }
-            Self::Zip(e) => write!(f, "zip error: {}", e),
-            Self::Io(e) => write!(f, "io error: {}", e),
-            Self::Jail(e) => write!(f, "jail error: {}", e),
+            Self::Zip(e) => write!(f, "zip format error: {}", e),
+            Self::Io(e) => write!(f, "I/O error: {}", e),
+            Self::Jail(e) => write!(f, "path validation error: {}", e),
         }
     }
 }
@@ -348,227 +397,25 @@ impl std::error::Error for Error {
 
 ### 6.1 Two-Pass Extraction (ValidateFirst Mode)
 
-When `ExtractionMode::ValidateFirst` is set, extraction happens in two phases:
+When `ExtractionMode::ValidateFirst` is set:
 
-```rust
-pub fn extract<R: Read + Seek>(self, reader: R) -> Result<Report, Error> {
-    let mut archive = zip::ZipArchive::new(reader)?;
-    
-    if matches!(self.mode, ExtractionMode::ValidateFirst) {
-        // Pass 1: Validate all entries without extracting
-        self.validate_all(&mut archive)?;
-    }
-    
-    // Pass 2: Extract (or Pass 1 if Streaming mode)
-    self.extract_all(&mut archive)
-}
+1. **Pass 1 (Validation):** Iterate all entries using `by_index_raw()` (no decompression). Check paths, limits, policies. Accumulate totals.
+2. **Pass 2 (Extraction):** Only runs if validation passed. Extract files normally.
 
-fn validate_all<R: Read + Seek>(&self, archive: &mut ZipArchive<R>) -> Result<(), Error> {
-    let mut total_size: u64 = 0;
-    let mut file_count: usize = 0;
-    
-    for i in 0..archive.len() {
-        let entry = archive.by_index_raw(i)?;  // No decompression
-        let name = entry.name().to_string();
-        
-        // Check symlink policy
-        if entry.is_symlink() && matches!(self.symlinks, SymlinkPolicy::Error) {
-            return Err(Error::SymlinkNotAllowed { entry: name });
-        }
-        
-        // Check path depth
-        let depth = name.matches('/').count();
-        if depth > self.limits.max_path_depth {
-            return Err(Error::PathTooDeep {
-                entry: name,
-                depth,
-                limit: self.limits.max_path_depth,
-            });
-        }
-        
-        // Check single file size
-        if !entry.is_dir() && entry.size() > self.limits.max_single_file {
-            return Err(Error::FileTooLarge {
-                entry: name,
-                limit: self.limits.max_single_file,
-                size: entry.size(),
-            });
-        }
-        
-        // Validate path with path_jail
-        self.jail.join(&name).map_err(|e| Error::PathEscape {
-            entry: name.clone(),
-            detail: e.to_string(),
-        })?;
-        
-        // Accumulate totals
-        if !entry.is_dir() && !entry.is_symlink() {
-            total_size += entry.size();
-            file_count += 1;
-        }
-    }
-    
-    // Check totals
-    if total_size > self.limits.max_total_bytes {
-        return Err(Error::TotalSizeExceeded {
-            limit: self.limits.max_total_bytes,
-            would_be: total_size,
-        });
-    }
-    
-    if file_count > self.limits.max_file_count {
-        return Err(Error::FileCountExceeded {
-            limit: self.limits.max_file_count,
-        });
-    }
-    
-    Ok(())
-}
-```
+Key: `by_index_raw()` reads metadata without decompressing, making validation fast.
 
-The dry run uses `by_index_raw()` which reads metadata without decompressing, making it fast.
+### 6.2 Extraction Order
 
-### 6.2 Extraction Loop
+The extraction loop processes each entry in this order:
 
-```rust
-pub fn extract<R: Read + Seek>(self, reader: R) -> Result<Report, Error> {
-    let mut archive = zip::ZipArchive::new(reader)?;
-    let mut report = Report::default();
-    let mut total_bytes: u64 = 0;
-    
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
-        
-        // 1. Validate path with path_jail FIRST (even for symlinks)
-        // This ensures we catch traversal attempts before deciding to skip
-        self.jail.join(&name).map_err(|e| {
-            Error::PathEscape {
-                entry: name.clone(),
-                detail: e.to_string(),
-            }
-        })?;
-        
-        // 2. Check symlink policy
-        if entry.is_symlink() {
-            match self.symlinks {
-                SymlinkPolicy::Skip => {
-                    report.entries_skipped += 1;
-                    continue;
-                }
-                SymlinkPolicy::Error => {
-                    return Err(Error::SymlinkNotAllowed { entry: name });
-                }
-            }
-        }
-        
-        // 3. Build EntryInfo for filtering
-        let info = EntryInfo {
-            name: &name,
-            size: entry.size(),
-            compressed_size: entry.compressed_size(),
-            is_dir: entry.is_dir(),
-            is_symlink: entry.is_symlink(),
-        };
-        
-        // 4. Apply filter
-        if let Some(ref filter) = self.filter {
-            if !filter(&info) {
-                report.entries_skipped += 1;
-                continue;
-            }
-        }
-        
-        // 5. Check path depth (count actual directory segments)
-        let depth = std::path::Path::new(&name)
-            .components()
-            .filter(|c| matches!(c, std::path::Component::Normal(_)))
-            .count();
-        if depth > self.limits.max_path_depth {
-            return Err(Error::PathTooDeep {
-                entry: name,
-                depth,
-                limit: self.limits.max_path_depth,
-            });
-        }
-        
-        // 6. Check single file size
-        if !entry.is_dir() && entry.size() > self.limits.max_single_file {
-            return Err(Error::FileTooLarge {
-                entry: name,
-                limit: self.limits.max_single_file,
-                size: entry.size(),
-            });
-        }
-        
-        // 7. Check file count
-        if report.files_extracted >= self.limits.max_file_count {
-            return Err(Error::FileCountExceeded {
-                limit: self.limits.max_file_count,
-            });
-        }
-        
-        // 8. Check total size (before extraction)
-        if total_bytes + entry.size() > self.limits.max_total_bytes {
-            return Err(Error::TotalSizeExceeded {
-                limit: self.limits.max_total_bytes,
-                would_be: total_bytes + entry.size(),
-            });
-        }
-        
-        // 9. Build safe path for extraction (already validated above)
-        let safe_path = self.jail.join(&name).unwrap();
-        
-        // 10. Check overwrite policy
-        if safe_path.exists() {
-            match self.overwrite {
-                OverwritePolicy::Error => {
-                    return Err(Error::AlreadyExists {
-                        path: safe_path.display().to_string(),
-                    });
-                }
-                OverwritePolicy::Skip => {
-                    report.entries_skipped += 1;
-                    continue;
-                }
-                OverwritePolicy::Overwrite => {}
-            }
-        }
-        
-        // 11. Extract
-        if entry.is_dir() {
-            std::fs::create_dir_all(&safe_path)?;
-            report.dirs_created += 1;
-        } else {
-            // Ensure parent directory exists
-            if let Some(parent) = safe_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            
-            let mut outfile = std::fs::File::create(&safe_path)?;
-            let written = std::io::copy(&mut entry, &mut outfile)?;
-            
-            total_bytes += written;
-            report.bytes_written += written;
-            report.files_extracted += 1;
-            
-            // Apply permissions (Unix only, strip dangerous bits)
-            #[cfg(unix)]
-            if let Some(mode) = entry.unix_mode() {
-                use std::os::unix::fs::PermissionsExt;
-                // Strip setuid, setgid, sticky bits
-                let safe_mode = mode & 0o0777;
-                std::fs::set_permissions(
-                    &safe_path,
-                    std::fs::Permissions::from_mode(safe_mode),
-                )?;
-            }
-        }
-    }
-    
-    Ok(report)
-}
-```
+1. **Path validation** (path_jail) — catches traversal before any other checks
+2. **Symlink policy** — skip or error on symlinks
+3. **Filter callback** — user-defined skip logic
+4. **Limits** (depth, size, count) — resource constraints
+5. **Overwrite policy** — handle existing files
+6. **Extract** — write file, apply permissions
+
+This ordering ensures security checks run first and cannot be bypassed.
 
 ### 6.3 Filter Semantics
 
@@ -644,6 +491,25 @@ This prevents archives from creating setuid executables.
 
 **Windows:** Archive permissions are ignored. Windows does not use Unix-style permission bits.
 
+### 6.8 Strict Size Enforcement (LimitReader)
+
+Malicious zips can lie about declared size. A `LimitReader` wrapper enforces limits during actual read, returning EOF after `max_single_file` bytes regardless of header claims.
+
+### 6.9 Secure Overwrite
+
+Symlink attack: archive creates `/uploads/log -> /etc/passwd`, second extraction overwrites through symlink.
+
+Defense: Use `symlink_metadata()` to detect symlinks, remove them before writing (don't follow).
+
+### 6.10 Filename Sanitization
+
+Reject filenames with:
+- Empty names or just `/`
+- Control characters (< 0x20 or 0x7F)
+- Backslashes (Windows path confusion)
+- Path > 1024 bytes or component > 255 bytes
+- Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
+
 ## 7. Python API
 
 ### 7.1 Module Structure
@@ -714,62 +580,7 @@ data = request.stream.read()
 extract("/var/uploads", io.BytesIO(data))
 ```
 
-### 7.4 Type Stubs
-
-```python
-from os import PathLike
-from pathlib import Path
-from typing import Union, Callable, BinaryIO, Literal
-
-_PathType = Union[str, PathLike[str]]
-_OverwritePolicy = Literal["error", "skip", "overwrite"]
-_SymlinkPolicy = Literal["skip", "error"]
-_ExtractionMode = Literal["streaming", "validate_first"]
-
-class EntryInfo:
-    @property
-    def name(self) -> str: ...
-    @property
-    def size(self) -> int: ...
-    @property
-    def compressed_size(self) -> int: ...
-    @property
-    def is_dir(self) -> bool: ...
-    @property
-    def is_symlink(self) -> bool: ...
-
-class Report:
-    @property
-    def files_extracted(self) -> int: ...
-    @property
-    def dirs_created(self) -> int: ...
-    @property
-    def bytes_written(self) -> int: ...
-    @property
-    def entries_skipped(self) -> int: ...
-    @property
-    def destination(self) -> Path: ...  # Root where files were extracted
-
-class Extractor:
-    def __init__(self, destination: _PathType) -> None: ...
-    @property
-    def destination(self) -> Path: ...  # Returns pathlib.Path
-    def max_total_mb(self, mb: int) -> "Extractor": ...
-    def max_files(self, count: int) -> "Extractor": ...
-    def max_single_file_mb(self, mb: int) -> "Extractor": ...
-    def max_depth(self, depth: int) -> "Extractor": ...
-    def overwrite(self, policy: _OverwritePolicy) -> "Extractor": ...
-    def symlinks(self, policy: _SymlinkPolicy) -> "Extractor": ...
-    def mode(self, mode: _ExtractionMode) -> "Extractor": ...
-    def filter(self, f: Callable[[EntryInfo], bool]) -> "Extractor": ...
-    def extract(self, source: BinaryIO) -> Report: ...
-    def extract_file(self, path: _PathType) -> Report: ...
-
-def extract(destination: _PathType, source: BinaryIO) -> Report: ...
-def extract_file(destination: _PathType, path: _PathType) -> Report: ...
-```
-
-### 7.5 Error Handling
+### 7.4 Error Handling
 
 ```python
 from safe_unzip import extract_file, PathEscapeError, QuotaError
@@ -800,119 +611,41 @@ Note: Don't over-refine the exception hierarchy in v0.1. `QuotaError` covers all
 
 ## 8. Project Structure
 
-### 8.1 Monorepo Layout
+### 8.1 Flattened Layout
+
+This is a small crate with one binding. We use a flat structure:
 
 ```
 safe_unzip/
-├── Cargo.toml                    # Workspace root
-├── crates/
-│   └── safe_unzip/               # Core Rust library
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── extractor.rs
-│           ├── limits.rs
-│           └── error.rs
-├── bindings/
-│   └── python/                   # Python bindings
-│       ├── Cargo.toml
-│       ├── pyproject.toml
-│       ├── src/
-│       │   └── lib.rs
-│       └── python/
-│           └── safe_unzip/
-│               ├── __init__.py
-│               ├── __init__.pyi
-│               └── py.typed
+├── Cargo.toml                    # Workspace root + core library
+├── src/
+│   ├── lib.rs                    # Public API
+│   ├── extractor.rs              # Core extraction logic
+│   ├── limits.rs                 # Resource limits
+│   └── error.rs                  # Error types
+├── python/                       # Python bindings
+│   ├── Cargo.toml
+│   ├── pyproject.toml
+│   ├── src/
+│   │   └── lib.rs                # PyO3 bindings
+│   └── python/
+│       └── safe_unzip/
+│           ├── __init__.py
+│           ├── __init__.pyi      # Type stubs
+│           └── py.typed          # PEP 561 marker
 ├── tests/
-│   └── fixtures/                 # Shared test archives
-│       ├── normal.zip
-│       ├── traversal.zip
-│       ├── symlink_escape.zip
-│       ├── bomb_size.zip
-│       ├── bomb_count.zip
-│       ├── deep_path.zip
-│       └── setuid.zip
+│   └── security_test.rs          # Integration tests
 ├── README.md
 ├── LICENSE-MIT
 └── LICENSE-APACHE
 ```
 
-### 8.2 Workspace Configuration
+### 8.2 Key Configuration
 
-```toml
-# Root Cargo.toml
-[workspace]
-members = ["crates/*", "bindings/*"]
-resolver = "2"
-
-[workspace.package]
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/aimable100/safe_unzip"
-```
-
-```toml
-# crates/safe_unzip/Cargo.toml
-[package]
-name = "safe_unzip"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Secure zip extraction. Prevents Zip Slip and Zip Bombs."
-keywords = ["zip", "security", "archive", "extraction", "safe"]
-categories = ["filesystem", "compression"]
-
-[dependencies]
-path_jail = "0.1"
-zip = "2.1"
-
-[dev-dependencies]
-tempfile = "3"
-```
-
-```toml
-# bindings/python/Cargo.toml
-[package]
-name = "safe_unzip_python"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[lib]
-name = "safe_unzip"
-crate-type = ["cdylib"]
-
-[dependencies]
-safe_unzip = { path = "../../crates/safe_unzip" }
-pyo3 = { version = "0.21", features = ["extension-module"] }
-```
-
-```toml
-# bindings/python/pyproject.toml
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
-
-[project]
-name = "safe-unzip"
-version = "0.1.0"
-description = "Secure zip extraction. Prevents Zip Slip and Zip Bombs."
-readme = "README.md"
-license = {text = "MIT OR Apache-2.0"}
-requires-python = ">=3.8"
-classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Topic :: Security",
-    "Topic :: System :: Archiving :: Compression",
-]
-
-[tool.maturin]
-python-source = "python"
-module-name = "safe_unzip.safe_unzip"
-```
+- **Root `Cargo.toml`**: Workspace with `members = [".", "python"]`
+- **Dependencies**: `path_jail = "0.1"`, `zip = "2.1"`
+- **Python bindings**: PyO3 0.22, maturin build system
+- **Package name**: `safe-unzip` on PyPI, `safe_unzip` on crates.io
 
 ## 9. Test Strategy
 
@@ -932,297 +665,21 @@ tests/fixtures/
 └── setuid.zip              # Contains setuid executable
 ```
 
-### 9.2 Rust Tests
+### 9.2 Required Test Coverage
 
-```rust
-#[test]
-fn blocks_traversal() {
-    let dir = tempdir().unwrap();
-    let result = extract_file(dir.path(), "tests/fixtures/traversal.zip");
-    assert!(matches!(result, Err(Error::PathEscape { .. })));
-}
+**Rust tests must verify:**
+- Path traversal blocked (`PathEscape` error)
+- Symlink escape blocked (skip or `SymlinkNotAllowed`)
+- Size limits enforced (`TotalSizeExceeded`, `FileTooLarge`)
+- File count limits enforced (`FileCountExceeded`)
+- Path depth limits enforced (`PathTooDeep`)
+- Overwrite policies work (Error, Skip, Overwrite)
+- Filter callback works
+- ValidateFirst prevents partial state
+- Setuid bits stripped (Unix only)
+- Size mismatch detected (`SizeMismatch`)
 
-#[test]
-fn blocks_symlink_escape() {
-    let dir = tempdir().unwrap();
-    let result = Extractor::new(dir.path())
-        .unwrap()
-        .symlinks(SymlinkPolicy::Error)
-        .extract_file("tests/fixtures/symlink_escape.zip");
-    assert!(matches!(result, Err(Error::SymlinkNotAllowed { .. })));
-}
-
-#[test]
-fn enforces_size_limit() {
-    let dir = tempdir().unwrap();
-    let result = Extractor::new(dir.path())
-        .unwrap()
-        .limits(Limits {
-            max_total_bytes: 1024,
-            ..Default::default()
-        })
-        .extract_file("tests/fixtures/bomb_size.zip");
-    assert!(matches!(result, Err(Error::TotalSizeExceeded { .. })));
-}
-
-#[test]
-fn skips_symlinks_by_default() {
-    let dir = tempdir().unwrap();
-    let report = extract_file(dir.path(), "tests/fixtures/symlink_escape.zip").unwrap();
-    assert!(report.entries_skipped > 0);
-}
-
-#[test]
-fn respects_overwrite_error() {
-    let dir = tempdir().unwrap();
-    // First extraction
-    extract_file(dir.path(), "tests/fixtures/normal.zip").unwrap();
-    // Second should fail
-    let result = extract_file(dir.path(), "tests/fixtures/normal.zip");
-    assert!(matches!(result, Err(Error::AlreadyExists { .. })));
-}
-
-#[test]
-fn respects_overwrite_skip() {
-    let dir = tempdir().unwrap();
-    extract_file(dir.path(), "tests/fixtures/normal.zip").unwrap();
-    let report = Extractor::new(dir.path())
-        .unwrap()
-        .overwrite(OverwritePolicy::Skip)
-        .extract_file("tests/fixtures/normal.zip")
-        .unwrap();
-    assert!(report.entries_skipped > 0);
-}
-
-#[test]
-fn filter_works() {
-    let dir = tempdir().unwrap();
-    let report = Extractor::new(dir.path())
-        .unwrap()
-        .filter(|e| e.name.ends_with(".txt"))
-        .extract_file("tests/fixtures/normal.zip")
-        .unwrap();
-    // Only .txt files extracted
-}
-
-#[test]
-fn validate_first_catches_traversal_before_extraction() {
-    let dir = tempdir().unwrap();
-    
-    // With ValidateFirst, nothing should be written on failure
-    let result = Extractor::new(dir.path())
-        .unwrap()
-        .mode(ExtractionMode::ValidateFirst)
-        .extract_file("tests/fixtures/traversal.zip");
-    
-    assert!(matches!(result, Err(Error::PathEscape { .. })));
-    // Directory should be empty (nothing extracted)
-    assert!(dir.path().read_dir().unwrap().next().is_none());
-}
-
-#[cfg(unix)]
-#[test]
-fn strips_setuid() {
-    let dir = tempdir().unwrap();
-    extract_file(dir.path(), "tests/fixtures/setuid.zip").unwrap();
-    let meta = std::fs::metadata(dir.path().join("setuid_binary")).unwrap();
-    let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions());
-    assert_eq!(mode & 0o7000, 0);  // No setuid/setgid/sticky
-}
-```
-
-### 9.3 Python Tests
-
-```python
-import pytest
-from safe_unzip import extract_file, Extractor, PathEscapeError, QuotaError
-
-def test_blocks_traversal(tmp_path):
-    with pytest.raises(PathEscapeError):
-        extract_file(tmp_path, "tests/fixtures/traversal.zip")
-
-def test_enforces_size_limit(tmp_path):
-    with pytest.raises(QuotaError):
-        Extractor(tmp_path).max_total_mb(1).extract_file("tests/fixtures/bomb_size.zip")
-
-def test_filter(tmp_path):
-    report = (
-        Extractor(tmp_path)
-        .filter(lambda e: e.name.endswith(".txt"))
-        .extract_file("tests/fixtures/normal.zip")
-    )
-    # Verify only .txt files exist
-
-def test_validate_first_no_partial_state(tmp_path):
-    with pytest.raises(PathEscapeError):
-        (
-            Extractor(tmp_path)
-            .mode("validate_first")
-            .extract_file("tests/fixtures/traversal.zip")
-        )
-    # Nothing should be extracted
-    assert list(tmp_path.iterdir()) == []
-```
-
-## 10. README
-
-```markdown
-# safe_unzip
-
-[![Crates.io](https://img.shields.io/crates/v/safe_unzip.svg)](https://crates.io/crates/safe_unzip)
-[![PyPI](https://img.shields.io/pypi/v/safe-unzip.svg)](https://pypi.org/project/safe-unzip/)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
-
-Zip extraction that won't ruin your day.
-
-## The Problem
-
-Zip files can contain malicious paths:
-
-```python
-# Python's zipfile is vulnerable
-import zipfile
-zipfile.ZipFile("evil.zip").extractall("/var/uploads")
-# Extracts ../../etc/cron.d/pwned -> /etc/cron.d/pwned
-```
-
-This is CVE-2018-1000001 (Zip Slip).
-
-## The Solution
-
-```python
-from safe_unzip import extract_file
-
-extract_file("/var/uploads", "evil.zip")
-# Raises: PathEscapeError("../../etc/cron.d/pwned")
-```
-
-## Features
-
-- **Path traversal protection** via path_jail
-- **Zip bomb protection** with configurable limits
-- **Symlink handling** (skip or error)
-- **Filter callback** for selective extraction
-- **Zero unsafe code**
-
-## Installation
-
-```bash
-# Rust
-cargo add safe_unzip
-
-# Python
-pip install safe-unzip
-```
-
-## Usage
-
-### Rust
-
-```rust
-use safe_unzip::{extract_file, Extractor, Limits};
-
-// Simple
-let report = extract_file("/var/uploads", "archive.zip")?;
-
-// With options
-let report = Extractor::new("/var/uploads")?
-    .limits(Limits {
-        max_total_bytes: 500 * 1024 * 1024,  // 500 MB
-        max_file_count: 1000,
-        ..Default::default()
-    })
-    .filter(|e| e.name.ends_with(".png"))
-    .extract_file("archive.zip")?;
-
-println!("Extracted {} files", report.files_extracted);
-```
-
-### Python
-
-```python
-from safe_unzip import extract_file, Extractor
-
-# Simple
-report = extract_file("/var/uploads", "archive.zip")
-
-# With options
-report = (
-    Extractor("/var/uploads")
-    .max_total_mb(500)
-    .max_files(1000)
-    .filter(lambda e: e.name.endswith(".png"))
-    .extract_file("archive.zip")
-)
-
-print(f"Extracted {report.files_extracted} files")
-```
-
-### Validate Before Extracting
-
-Use `validate_first` mode to catch errors before writing any files:
-
-```python
-report = (
-    Extractor("/var/uploads")
-    .mode("validate_first")  # Dry run first, then extract
-    .extract_file("untrusted.zip")
-)
-```
-
-### Filter by Extension
-
-Only extract specific file types:
-
-```rust
-// Rust: Only images
-.filter(|e| {
-    e.name.ends_with(".png") || 
-    e.name.ends_with(".jpg")
-})
-```
-
-```python
-# Python: Only images
-.filter(lambda e: e.name.endswith((".png", ".jpg")))
-```
-
-## Security
-
-| Threat | Protection |
-|--------|------------|
-| Zip Slip (path traversal) | path_jail validates every entry |
-| Zip Bomb (size) | Configurable total size limit |
-| Zip Bomb (count) | Configurable file count limit |
-| Symlink attacks | Skipped by default |
-| Setuid binaries | Dangerous permission bits stripped |
-
-## Limitations
-
-- Zip format only (tar support planned for v0.2)
-- Requires seekable input (no stdin streaming)
-- Partial extraction on failure in streaming mode (use `validate_first` mode to avoid)
-
-## License
-
-MIT OR Apache-2.0
-```
-
-## 11. Checklist
-
-- [ ] Core `Extractor` struct
-- [ ] `path_jail` integration
-- [ ] Limits enforcement
-- [ ] Overwrite policies
-- [ ] Symlink policies
-- [ ] ExtractionMode (Streaming, ValidateFirst)
-- [ ] Filter callback
-- [ ] Unix permission handling
-- [ ] Error types
-- [ ] Unit tests
-- [ ] Integration tests with malicious fixtures
-- [ ] Python bindings
-- [ ] Python tests
-- [ ] README
-- [ ] `cargo publish`
-- [ ] `maturin publish`
+**Python tests must verify:**
+- Same security guarantees as Rust
+- Exception hierarchy works (`PathEscapeError`, `QuotaError`, etc.)
+- Builder API works with string policies

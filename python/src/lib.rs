@@ -15,40 +15,46 @@ pyo3::create_exception!(safe_unzip, AlreadyExistsError, SafeUnzipError);
 fn to_py_err(err: safe_unzip::Error) -> PyErr {
     match err {
         safe_unzip::Error::PathEscape { entry, detail } => {
-            PathEscapeError::new_err(format!("Path escape in '{}': {}", entry, detail))
+            PathEscapeError::new_err(format!("path '{}' escapes destination: {}", entry, detail))
         }
         safe_unzip::Error::SymlinkNotAllowed { entry } => {
-            SymlinkNotAllowedError::new_err(format!("Symlink not allowed: '{}'", entry))
+            SymlinkNotAllowedError::new_err(format!("archive contains symlink '{}' (symlinks not allowed)", entry))
         }
         safe_unzip::Error::TotalSizeExceeded { limit, would_be } => {
-            QuotaError::new_err(format!("Total size {} exceeds limit {}", would_be, limit))
+            QuotaError::new_err(format!("extraction would write {} bytes, exceeding the {} byte limit", would_be, limit))
         }
-        safe_unzip::Error::FileCountExceeded { limit } => {
-            QuotaError::new_err(format!("File count exceeds limit {}", limit))
+        safe_unzip::Error::FileCountExceeded { limit, attempted } => {
+            QuotaError::new_err(format!("archive contains {} files, exceeding the {} file limit", attempted, limit))
         }
         safe_unzip::Error::FileTooLarge { entry, limit, size } => {
-            QuotaError::new_err(format!("'{}' size {} exceeds limit {}", entry, size, limit))
+            QuotaError::new_err(format!("file '{}' is {} bytes (limit: {} bytes)", entry, size, limit))
+        }
+        safe_unzip::Error::SizeMismatch { entry, declared, actual } => {
+            QuotaError::new_err(format!(
+                "file '{}' decompressed to {} bytes but declared {} bytes (possible zip bomb)",
+                entry, actual, declared
+            ))
         }
         safe_unzip::Error::PathTooDeep { entry, depth, limit } => {
-            QuotaError::new_err(format!("'{}' depth {} exceeds limit {}", entry, depth, limit))
+            QuotaError::new_err(format!("path '{}' has {} directory levels (limit: {})", entry, depth, limit))
         }
         safe_unzip::Error::AlreadyExists { path } => {
-            AlreadyExistsError::new_err(format!("File already exists: '{}'", path))
+            AlreadyExistsError::new_err(format!("file '{}' already exists", path))
         }
-        safe_unzip::Error::InvalidFilename { entry } => {
-            PathEscapeError::new_err(format!("Invalid filename: '{}'", entry))
+        safe_unzip::Error::InvalidFilename { entry, reason } => {
+            PathEscapeError::new_err(format!("invalid filename '{}': {}", entry, reason))
         }
         safe_unzip::Error::DestinationNotFound { path } => {
-            PyIOError::new_err(format!("Destination not found: '{}'", path))
+            PyIOError::new_err(format!("destination directory '{}' does not exist", path))
         }
         safe_unzip::Error::Zip(e) => {
-            PyValueError::new_err(format!("Zip error: {}", e))
+            PyValueError::new_err(format!("zip format error: {}", e))
         }
         safe_unzip::Error::Io(e) => {
-            PyIOError::new_err(format!("IO error: {}", e))
+            PyIOError::new_err(format!("I/O error: {}", e))
         }
         safe_unzip::Error::Jail(e) => {
-            PathEscapeError::new_err(format!("Jail error: {}", e))
+            PathEscapeError::new_err(format!("path validation error: {}", e))
         }
     }
 }

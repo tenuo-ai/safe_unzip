@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "safe-unzip"
 version = "0.1.0"
 description = "Secure zip extraction. Prevents Zip Slip and Zip Bombs."
-readme = "../README.md"
+readme = "../../README.md"
 license = {text = "MIT OR Apache-2.0"}
 requires-python = ">=3.8"
 authors = [

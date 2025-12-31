@@ -91,6 +91,21 @@ let report = Extractor::new("/var/uploads")?
     .extract_file("archive.zip")?;
 ```
 
+### Create Destination if Missing
+
+```rust
+use safe_unzip::Extractor;
+
+// Extractor::new() errors if destination doesn't exist (catches typos)
+// Extractor::new_or_create() creates it automatically
+let report = Extractor::new_or_create("/var/uploads/new_folder")?
+    .extract_file("archive.zip")?;
+
+// The convenience functions (extract_file, extract) also create automatically
+use safe_unzip::extract_file;
+extract_file("/var/uploads/new_folder", "archive.zip")?;
+```
+
 ### Custom Limits (Prevent Zip Bombs)
 
 ```rust
@@ -163,9 +178,14 @@ let report = Extractor::new("/var/uploads")?
     .extract_file("archive.zip")?;
 ```
 
-### Validate Before Extracting
+### Extraction Modes
 
-Use `ValidateFirst` mode to catch all errors **before** writing any files:
+| Mode | Speed | On Failure | Use When |
+|------|-------|------------|----------|
+| `Streaming` (default) | Fast (1 pass) | Partial files remain | Speed matters; you'll clean up on error |
+| `ValidateFirst` | Slower (2 passes) | No files if validation fails | Can't tolerate partial state |
+
+**⚠️ Neither mode is truly atomic.** If extraction fails mid-write (e.g., disk full), partial files remain regardless of mode. `ValidateFirst` only prevents writes when *validation* fails (bad paths, limits exceeded), not when I/O fails during extraction.
 
 ```rust
 use safe_unzip::{Extractor, ExtractionMode};
@@ -178,7 +198,7 @@ let report = Extractor::new("/var/uploads")?
     .extract_file("untrusted.zip")?;
 ```
 
-This prevents partial extraction state when an archive contains a mix of valid and malicious entries.
+Use `ValidateFirst` when you can't tolerate partial state from malicious archives. Use `Streaming` (default) when speed matters and you can clean up on error.
 
 ### Extracting from Memory
 

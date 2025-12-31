@@ -5,30 +5,76 @@ use path_jail::Jail;
 use crate::error::Error;
 use crate::limits::Limits;
 
-// Policies
+/// What to do when a file already exists at the extraction path.
+///
+/// # Security Note
+///
+/// The default (`Error`) is safest—it prevents accidental overwrites of sensitive files.
+/// `Overwrite` includes symlink protection: if the target is a symlink, it's removed
+/// before writing to prevent symlink-following attacks.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OverwritePolicy {
+    /// Fail extraction if file exists. Safest default.
     #[default]
     Error,
+    /// Skip files that already exist. Useful for resumable extraction.
     Skip,
+    /// Overwrite existing files. Symlinks are removed before overwriting (security).
     Overwrite,
 }
 
+/// What to do with symlinks in the archive.
+///
+/// # Security Note
+///
+/// Symlinks in untrusted archives are dangerous. A malicious archive could:
+/// - Create `uploads/evil -> /etc/passwd` then extract content to `uploads/evil`
+/// - Create `..` symlinks to escape the destination directory
+///
+/// The default (`Skip`) silently ignores symlinks, which is safe but may surprise users.
+/// Use `Error` if you want to explicitly reject archives containing symlinks.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SymlinkPolicy {
+    /// Ignore symlinks silently. Safe default.
     #[default]
     Skip,
+    /// Fail extraction if archive contains any symlinks.
     Error,
 }
 
 /// Extraction strategy.
+///
+/// # Tradeoffs
+///
+/// | Mode | Speed | On Failure | Use When |
+/// |------|-------|------------|----------|
+/// | `Streaming` | Fast (1 pass) | Partial files remain on disk | Speed matters; you'll clean up on error |
+/// | `ValidateFirst` | Slower (2 passes) | No files written if validation fails | Can't tolerate partial state |
+///
+/// ## Important Limitations
+///
+/// **Neither mode is truly atomic.** If extraction fails mid-write (e.g., disk full),
+/// partial files will remain regardless of mode. `ValidateFirst` only prevents writes
+/// when *validation* fails (bad paths, exceeded limits, etc.), not when I/O fails.
+///
+/// For true atomicity, extract to a temp directory and move on success (planned for v0.2).
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ExtractionMode {
-    /// Extract immediately. Partial state on failure.
+    /// Extract entries as they are read. Fast but leaves partial state on failure.
+    ///
+    /// **Tradeoff:** If extraction fails on entry N, entries 1..N-1 remain on disk.
+    /// Use this when speed matters and you can clean up on error.
     #[default]
     Streaming,
-    /// Validate all entries first, then extract.
-    /// Slower (2x iteration) but no partial state on validation failure.
+    
+    /// Validate all entries first (paths, limits, policies), then extract.
+    ///
+    /// **Tradeoff:** 2x slower (iterates archive twice), but guarantees no files are
+    /// written if validation fails. Still not atomic for I/O failures during extraction.
+    ///
+    /// Note: Filter callbacks are NOT applied during validation. Limits are checked
+    /// against all entries, which is conservative—validation may reject archives that
+    /// would succeed with filtering.
     ValidateFirst,
 }
 
@@ -60,17 +106,59 @@ pub struct Extractor {
 }
 
 impl Extractor {
+    /// Create an extractor for the given destination directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DestinationNotFound`] if the destination doesn't exist.
+    /// Use [`Self::new_or_create`] if you want to create the directory automatically.
+    ///
+    /// # Security Note
+    ///
+    /// Requiring the destination to exist catches typos like `/var/uplaods` that would
+    /// otherwise silently create a wrong directory. This is intentional for the explicit API.
     pub fn new<P: AsRef<Path>>(destination: P) -> Result<Self, Error> {
-        // Ensure root exists so Jail can canonicalize it
-        if !destination.as_ref().exists() {
-            return Err(Error::DestinationNotFound {
-                path: destination.as_ref().to_string_lossy().to_string(),
-            });
+        Self::new_impl(destination.as_ref(), false)
+    }
+
+    /// Create an extractor, creating the destination directory if it doesn't exist.
+    ///
+    /// This is a convenience method for cases where you want "just works" behavior.
+    /// The directory is created with default permissions (respecting umask).
+    ///
+    /// # Security Note
+    ///
+    /// Be careful with user-provided paths. A typo like `/var/uplaods` will silently
+    /// create a new directory instead of failing. Consider using [`Self::new`] and
+    /// handling [`Error::DestinationNotFound`] explicitly for user-facing code.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// // Creates /tmp/extracted if it doesn't exist
+    /// let extractor = Extractor::new_or_create("/tmp/extracted")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn new_or_create<P: AsRef<Path>>(destination: P) -> Result<Self, Error> {
+        Self::new_impl(destination.as_ref(), true)
+    }
+
+    fn new_impl(destination: &Path, create: bool) -> Result<Self, Error> {
+        if !destination.exists() {
+            if create {
+                fs::create_dir_all(destination)?;
+            } else {
+                return Err(Error::DestinationNotFound {
+                    path: destination.to_string_lossy().to_string(),
+                });
+            }
         }
 
-        let jail = Jail::new(destination.as_ref())?;
+        let jail = Jail::new(destination)?;
         Ok(Self {
-            root: destination.as_ref().to_path_buf(),
+            root: destination.to_path_buf(),
             jail,
             limits: Limits::default(),
             overwrite: OverwritePolicy::default(),
@@ -125,8 +213,11 @@ impl Extractor {
             // println!("DEBUG: Processing entry: {}", name);
 
             // 0. SECURITY: Filename Sanitization
-            if !self.is_valid_filename(&name) {
-                return Err(Error::InvalidFilename { entry: name });
+            if let Err(reason) = self.validate_filename(&name) {
+                return Err(Error::InvalidFilename { 
+                    entry: name, 
+                    reason: reason.to_string() 
+                });
             }
 
             // 1. SECURITY: Path Validation (Path Jail)
@@ -186,7 +277,10 @@ impl Extractor {
             // 5. CHECK: Limits (Count & Lookahead Total)
             // Check file count
             if report.files_extracted >= self.limits.max_file_count {
-                return Err(Error::FileCountExceeded { limit: self.limits.max_file_count });
+                return Err(Error::FileCountExceeded { 
+                    limit: self.limits.max_file_count,
+                    attempted: report.files_extracted + 1,
+                });
             }
 
             // Check single file size (declared)
@@ -310,23 +404,16 @@ impl Extractor {
                     // Which implies one of the above errors triggered.
                 }
 
-                // If the file is a ZIP BOMB (decompresses to MORE than declared size),
-                // LimitReader will stop at declared size.
-                // We should error if there is still data in `entry`.
-                // But `zip` crate might not make it easy to peek.
-                // However, `copy` returns `written`. 
-                // If `written == hard_limit` (which is capped at `entry.size()`),
-                // and real data > `entry.size()`, we effectively truncated it.
-                // Ideally we error on mismatch.
-                // We can try valid_size check.
+                // SECURITY: Detect zip bombs that lie about declared size.
+                // If we wrote exactly the declared size, check if there's more data.
+                // If so, the file is larger than declared (potential zip bomb).
                 if written == entry.size() {
-                    // Try reading one more byte to see if there is more
                     let mut buf = [0u8; 1];
                     if entry.read(&mut buf)? > 0 {
-                         return Err(Error::FileTooLarge {
+                        return Err(Error::SizeMismatch {
                             entry: name.clone(),
-                            limit: entry.size(),
-                            size: entry.size() + 1,
+                            declared: entry.size(),
+                            actual: entry.size() + 1, // At least this much more
                         });
                     }
                 }
@@ -372,8 +459,11 @@ impl Extractor {
             let name = entry.name().to_string();
             
             // 0. Filename sanitization
-            if !self.is_valid_filename(&name) {
-                return Err(Error::InvalidFilename { entry: name });
+            if let Err(reason) = self.validate_filename(&name) {
+                return Err(Error::InvalidFilename { 
+                    entry: name, 
+                    reason: reason.to_string() 
+                });
             }
 
             // 1. Path validation (Zip Slip check)
@@ -427,6 +517,7 @@ impl Extractor {
         if file_count > self.limits.max_file_count {
             return Err(Error::FileCountExceeded {
                 limit: self.limits.max_file_count,
+                attempted: file_count,
             });
         }
 
@@ -440,25 +531,30 @@ impl Extractor {
         self.extract(reader)
     }
 
-    fn is_valid_filename(&self, name: &str) -> bool {
+    /// Validate filename. Returns Ok(()) if valid, Err(reason) if invalid.
+    fn validate_filename(&self, name: &str) -> Result<(), &'static str> {
         // Reject empty names
         if name.is_empty() {
-            return false;
+            return Err("empty filename");
         }
         
         // Reject control characters (includes null bytes)
         if name.chars().any(|c| c.is_control()) {
-            return false;
+            return Err("contains control characters");
         }
         
         // Reject backslashes (Windows path separator could bypass Unix checks)
         if name.contains('\\') {
-            return false;
+            return Err("contains backslash");
         }
         
         // Reject extremely long filenames (filesystem limits)
-        if name.len() > 1024 || name.split('/').any(|component| component.len() > 255) {
-            return false;
+        if name.len() > 1024 {
+            return Err("path too long (>1024 bytes)");
+        }
+        
+        if name.split('/').any(|component| component.len() > 255) {
+            return Err("path component too long (>255 bytes)");
         }
 
         // Check path components for reserved names
@@ -473,13 +569,15 @@ impl Extractor {
                     match file_stem {
                         "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | 
                         "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | 
-                        "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => return false,
+                        "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                            return Err("Windows reserved name");
+                        }
                         _ => {}
                     }
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
