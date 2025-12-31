@@ -280,16 +280,16 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_bytes, m)?)?;
 
     // Exceptions
-    m.add("SafeUnzipError", py.get_type_bound::<SafeUnzipError>())?;
-    m.add("PathEscapeError", py.get_type_bound::<PathEscapeError>())?;
+    m.add("SafeUnzipError", py.get_type::<SafeUnzipError>())?;
+    m.add("PathEscapeError", py.get_type::<PathEscapeError>())?;
     m.add(
         "SymlinkNotAllowedError",
-        py.get_type_bound::<SymlinkNotAllowedError>(),
+        py.get_type::<SymlinkNotAllowedError>(),
     )?;
-    m.add("QuotaError", py.get_type_bound::<QuotaError>())?;
+    m.add("QuotaError", py.get_type::<QuotaError>())?;
     m.add(
         "AlreadyExistsError",
-        py.get_type_bound::<AlreadyExistsError>(),
+        py.get_type::<AlreadyExistsError>(),
     )?;
 
     Ok(())

@@ -13,4 +13,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 safe_unzip = { path = ".." }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.24", features = ["extension-module"] }
