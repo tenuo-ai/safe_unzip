@@ -107,6 +107,7 @@ jobs:
         run: cd python && maturin build --release
       
       - name: Install Python bindings
+        shell: bash
         run: pip install python/target/wheels/*.whl
       
       - name: Run Python tests
