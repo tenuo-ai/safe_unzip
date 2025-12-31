@@ -287,10 +287,7 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<SymlinkNotAllowedError>(),
     )?;
     m.add("QuotaError", py.get_type::<QuotaError>())?;
-    m.add(
-        "AlreadyExistsError",
-        py.get_type::<AlreadyExistsError>(),
-    )?;
+    m.add("AlreadyExistsError", py.get_type::<AlreadyExistsError>())?;
 
     Ok(())
 }
