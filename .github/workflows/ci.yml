@@ -16,7 +16,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os:
+          - ubuntu-latest        # Linux x86_64
+          - ubuntu-24.04-arm     # Linux arm64
+          - macos-latest         # macOS arm64 (Apple Silicon)
+          - macos-13             # macOS x86_64 (Intel)
+          - windows-latest       # Windows x86_64
+          - windows-11-arm       # Windows arm64
     
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +80,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os:
+          - ubuntu-latest        # Linux x86_64
+          - ubuntu-24.04-arm     # Linux arm64
+          - macos-latest         # macOS arm64 (Apple Silicon)
+          - macos-13             # macOS x86_64 (Intel)
+          - windows-latest       # Windows x86_64
+          - windows-11-arm       # Windows arm64
         python-version: ['3.9', '3.x']  # min supported + latest (3.14)
     
     steps:
