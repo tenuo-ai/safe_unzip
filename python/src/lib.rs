@@ -11,6 +11,7 @@ pyo3::create_exception!(safe_unzip, PathEscapeError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, SymlinkNotAllowedError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, QuotaError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, AlreadyExistsError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, EncryptedArchiveError, SafeUnzipError);
 
 fn to_py_err(err: safe_unzip::Error) -> PyErr {
     match err {
@@ -55,6 +56,10 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
         safe_unzip::Error::InvalidFilename { entry, reason } => {
             PathEscapeError::new_err(format!("invalid filename '{}': {}", entry, reason))
         }
+        safe_unzip::Error::EncryptedEntry { entry } => EncryptedArchiveError::new_err(format!(
+            "entry '{}' is encrypted (encrypted archives not supported)",
+            entry
+        )),
         safe_unzip::Error::DestinationNotFound { path } => {
             PyIOError::new_err(format!("destination directory '{}' does not exist", path))
         }
@@ -288,6 +293,10 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("QuotaError", py.get_type::<QuotaError>())?;
     m.add("AlreadyExistsError", py.get_type::<AlreadyExistsError>())?;
+    m.add(
+        "EncryptedArchiveError",
+        py.get_type::<EncryptedArchiveError>(),
+    )?;
 
     Ok(())
 }

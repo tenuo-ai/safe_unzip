@@ -32,6 +32,7 @@ from safe_unzip._safe_unzip import (
     SymlinkNotAllowedError,
     QuotaError,
     AlreadyExistsError,
+    EncryptedArchiveError,
 )
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
     "SymlinkNotAllowedError",
     "QuotaError",
     "AlreadyExistsError",
+    "EncryptedArchiveError",
 ]
 
 __version__ = "0.1.0"
