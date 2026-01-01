@@ -19,7 +19,8 @@ async = ["tokio"]
 
 [dependencies]
 path_jail = "0.2"
-zip = "2.1"
+# Use minimal zip features to avoid heavy compression dependencies
+zip = { version = "2.1", default-features = false, features = ["deflate", "time"] }
 tar = "0.4"
 flate2 = "1"  # For .tar.gz support
 tokio = { version = "1", features = ["rt", "fs", "sync"], optional = true }

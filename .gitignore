@@ -2,6 +2,11 @@
 /target/
 **/*.rs.bk
 
+# Fuzzing artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
 # Python
 __pycache__/
 *.py[cod]
