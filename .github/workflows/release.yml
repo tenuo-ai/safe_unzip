@@ -52,9 +52,7 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
         shell: bash
-        run: |
-          cp README.md python/README.md
-          cd python && maturin build --release --strip
+        run: cd python && maturin build --release --strip
       
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -78,9 +76,7 @@ jobs:
         run: pip install maturin
       
       - name: Build sdist
-        run: |
-          cp README.md python/README.md
-          cd python && maturin sdist
+        run: cd python && maturin sdist
       
       - name: Upload sdist
         uses: actions/upload-artifact@v4
