@@ -33,6 +33,7 @@ from safe_unzip._safe_unzip import (
     QuotaError,
     AlreadyExistsError,
     EncryptedArchiveError,
+    UnsupportedEntryTypeError,
 )
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "QuotaError",
     "AlreadyExistsError",
     "EncryptedArchiveError",
+    "UnsupportedEntryTypeError",
 ]
 
 __version__ = "0.1.0"

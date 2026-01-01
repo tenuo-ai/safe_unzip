@@ -237,7 +237,12 @@ impl Extractor {
             // 2. CHECK: Symlinks
             if entry.is_symlink() {
                 match self.symlinks {
-                    SymlinkPolicy::Error => return Err(Error::SymlinkNotAllowed { entry: name }),
+                    SymlinkPolicy::Error => {
+                        return Err(Error::SymlinkNotAllowed {
+                            entry: name,
+                            target: String::new(), // ZIP symlink targets require reading content
+                        })
+                    }
                     SymlinkPolicy::Skip => {
                         report.entries_skipped += 1;
                         continue;
@@ -324,7 +329,7 @@ impl Extractor {
                             Ok(f) => f,
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                                 return Err(Error::AlreadyExists {
-                                    path: safe_path.display().to_string(),
+                                    entry: safe_path.display().to_string(),
                                 });
                             }
                             Err(e) => return Err(Error::Io(e)),
@@ -481,7 +486,10 @@ impl Extractor {
 
             // 2. Symlink check
             if entry.is_symlink() && matches!(self.symlinks, SymlinkPolicy::Error) {
-                return Err(Error::SymlinkNotAllowed { entry: name });
+                return Err(Error::SymlinkNotAllowed {
+                    entry: name,
+                    target: String::new(), // ZIP symlink targets require reading content
+                });
             }
 
             // 3. Path depth check

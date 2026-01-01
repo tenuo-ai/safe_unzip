@@ -262,7 +262,7 @@ impl Driver {
                             Ok(f) => f,
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                                 return Err(Error::AlreadyExists {
-                                    path: safe_path.display().to_string(),
+                                    entry: safe_path.display().to_string(),
                                 });
                             }
                             Err(e) => return Err(e.into()),
@@ -539,7 +539,7 @@ impl Driver {
                     Ok(f) => Ok(Some(f)),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         Err(Error::AlreadyExists {
-                            path: path.display().to_string(),
+                            entry: path.display().to_string(),
                         })
                     }
                     Err(e) => Err(e.into()),

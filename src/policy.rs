@@ -287,7 +287,7 @@ impl SymlinkPolicy {
 
 impl Policy for SymlinkPolicy {
     fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
-        if matches!(entry.kind, EntryKind::Symlink { .. }) {
+        if let EntryKind::Symlink { target } = &entry.kind {
             match self.behavior {
                 SymlinkBehavior::Skip => {
                     // This will be handled by the extractor by skipping
@@ -296,6 +296,7 @@ impl Policy for SymlinkPolicy {
                 SymlinkBehavior::Error => {
                     return Err(Error::SymlinkNotAllowed {
                         entry: entry.name.clone(),
+                        target: target.clone(),
                     });
                 }
             }

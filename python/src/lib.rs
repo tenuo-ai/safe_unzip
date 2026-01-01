@@ -12,16 +12,26 @@ pyo3::create_exception!(safe_unzip, SymlinkNotAllowedError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, QuotaError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, AlreadyExistsError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, EncryptedArchiveError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, UnsupportedEntryTypeError, SafeUnzipError);
 
 fn to_py_err(err: safe_unzip::Error) -> PyErr {
     match err {
         safe_unzip::Error::PathEscape { entry, detail } => {
             PathEscapeError::new_err(format!("path '{}' escapes destination: {}", entry, detail))
         }
-        safe_unzip::Error::SymlinkNotAllowed { entry } => SymlinkNotAllowedError::new_err(format!(
-            "archive contains symlink '{}' (symlinks not allowed)",
-            entry
-        )),
+        safe_unzip::Error::SymlinkNotAllowed { entry, target } => {
+            if target.is_empty() {
+                SymlinkNotAllowedError::new_err(format!(
+                    "archive contains symlink '{}' (symlinks not allowed)",
+                    entry
+                ))
+            } else {
+                SymlinkNotAllowedError::new_err(format!(
+                    "archive contains symlink '{}' -> '{}' (symlinks not allowed)",
+                    entry, target
+                ))
+            }
+        }
         safe_unzip::Error::TotalSizeExceeded { limit, would_be } => QuotaError::new_err(format!(
             "extraction would write {} bytes, exceeding the {} byte limit",
             would_be, limit
@@ -50,8 +60,8 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
             "path '{}' has {} directory levels (limit: {})",
             entry, depth, limit
         )),
-        safe_unzip::Error::AlreadyExists { path } => {
-            AlreadyExistsError::new_err(format!("file '{}' already exists", path))
+        safe_unzip::Error::AlreadyExists { entry } => {
+            AlreadyExistsError::new_err(format!("file '{}' already exists", entry))
         }
         safe_unzip::Error::InvalidFilename { entry, reason } => {
             PathEscapeError::new_err(format!("invalid filename '{}': {}", entry, reason))
@@ -60,6 +70,12 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
             "entry '{}' is encrypted (encrypted archives not supported)",
             entry
         )),
+        safe_unzip::Error::UnsupportedEntryType { entry, entry_type } => {
+            UnsupportedEntryTypeError::new_err(format!(
+                "entry '{}' has unsupported type '{}' (device files, fifos not allowed)",
+                entry, entry_type
+            ))
+        }
         safe_unzip::Error::DestinationNotFound { path } => {
             PyIOError::new_err(format!("destination directory '{}' does not exist", path))
         }
@@ -68,6 +84,8 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
         safe_unzip::Error::Jail(e) => {
             PathEscapeError::new_err(format!("path validation error: {}", e))
         }
+        // Catch-all for future error variants (Error is #[non_exhaustive])
+        _ => SafeUnzipError::new_err(format!("{}", err)),
     }
 }
 
@@ -296,6 +314,10 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "EncryptedArchiveError",
         py.get_type::<EncryptedArchiveError>(),
+    )?;
+    m.add(
+        "UnsupportedEntryTypeError",
+        py.get_type::<UnsupportedEntryTypeError>(),
     )?;
 
     Ok(())

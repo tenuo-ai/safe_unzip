@@ -103,3 +103,7 @@ class EncryptedArchiveError(SafeUnzipError):
     """Archive contains encrypted entries (not supported)."""
     ...
 
+class UnsupportedEntryTypeError(SafeUnzipError):
+    """Archive contains unsupported entry type (device file, fifo, etc.)."""
+    ...
+

@@ -60,7 +60,8 @@ impl<R: Read> TarAdapter<R> {
 
             let name = entry.path()?.to_string_lossy().into_owned();
 
-            let kind = match header.entry_type() {
+            let entry_type = header.entry_type();
+            let kind = match entry_type {
                 tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::File,
                 tar::EntryType::Directory => EntryKind::Directory,
                 tar::EntryType::Symlink | tar::EntryType::Link => {
@@ -70,8 +71,13 @@ impl<R: Read> TarAdapter<R> {
                         .unwrap_or_default();
                     EntryKind::Symlink { target }
                 }
-                // Skip other types (block devices, char devices, fifos, etc.)
-                _ => continue,
+                // Reject device files, fifos, etc. - these are security risks
+                other => {
+                    return Err(Error::UnsupportedEntryType {
+                        entry: name,
+                        entry_type: entry_type_name(other),
+                    });
+                }
             };
 
             let info = EntryInfo {
@@ -111,7 +117,8 @@ impl<R: Read> TarAdapter<R> {
 
             let name = entry.path()?.to_string_lossy().into_owned();
 
-            let kind = match header.entry_type() {
+            let entry_type = header.entry_type();
+            let kind = match entry_type {
                 tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::File,
                 tar::EntryType::Directory => EntryKind::Directory,
                 tar::EntryType::Symlink | tar::EntryType::Link => {
@@ -121,7 +128,13 @@ impl<R: Read> TarAdapter<R> {
                         .unwrap_or_default();
                     EntryKind::Symlink { target }
                 }
-                _ => continue,
+                // Reject device files, fifos, etc. - these are security risks
+                other => {
+                    return Err(Error::UnsupportedEntryType {
+                        entry: name,
+                        entry_type: entry_type_name(other),
+                    });
+                }
             };
 
             let info = EntryInfo {
@@ -217,4 +230,22 @@ pub fn copy_limited<R: Read + ?Sized, W: Write>(
     }
 
     Ok(total)
+}
+
+/// Convert TAR entry type to a human-readable name.
+fn entry_type_name(entry_type: tar::EntryType) -> String {
+    match entry_type {
+        tar::EntryType::Regular => "regular file".into(),
+        tar::EntryType::Link => "hard link".into(),
+        tar::EntryType::Symlink => "symbolic link".into(),
+        tar::EntryType::Char => "character device".into(),
+        tar::EntryType::Block => "block device".into(),
+        tar::EntryType::Directory => "directory".into(),
+        tar::EntryType::Fifo => "fifo (named pipe)".into(),
+        tar::EntryType::Continuous => "continuous file".into(),
+        tar::EntryType::GNULongName => "GNU long name".into(),
+        tar::EntryType::GNULongLink => "GNU long link".into(),
+        tar::EntryType::GNUSparse => "GNU sparse file".into(),
+        _ => format!("unknown (0x{:02x})", entry_type.as_byte()),
+    }
 }

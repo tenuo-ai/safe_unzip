@@ -1,6 +1,6 @@
 //! Tests for TAR archive extraction.
 
-use safe_unzip::{Driver, TarAdapter, ValidationMode};
+use safe_unzip::{Driver, Limits, TarAdapter, ValidationMode};
 use std::io::Write;
 use tempfile::tempdir;
 
@@ -253,4 +253,438 @@ fn test_tar_gz_extraction() {
     assert_eq!(content, "I was compressed!");
 
     println!("✅ TAR.GZ extraction works");
+}
+
+// ===========================================================================
+// Security Tests for TAR-specific threats
+// ===========================================================================
+
+#[test]
+fn test_tar_rejects_block_device() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with block device entry
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("dev/sda").unwrap();
+    header.set_size(0);
+    header.set_mode(0o660);
+    header.set_entry_type(tar::EntryType::Block);
+    header.set_device_major(8).unwrap();
+    header.set_device_minor(0).unwrap();
+    header.set_cksum();
+
+    builder.append(&header, &[][..]).unwrap();
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path()).unwrap().extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::UnsupportedEntryType { .. }),
+        "Expected UnsupportedEntryType, got {:?}",
+        err
+    );
+
+    println!("✅ TAR rejects block device");
+}
+
+#[test]
+fn test_tar_rejects_char_device() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with character device entry (like /dev/null)
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("dev/null").unwrap();
+    header.set_size(0);
+    header.set_mode(0o666);
+    header.set_entry_type(tar::EntryType::Char);
+    header.set_device_major(1).unwrap();
+    header.set_device_minor(3).unwrap();
+    header.set_cksum();
+
+    builder.append(&header, &[][..]).unwrap();
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path()).unwrap().extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::UnsupportedEntryType { .. }),
+        "Expected UnsupportedEntryType, got {:?}",
+        err
+    );
+
+    println!("✅ TAR rejects character device");
+}
+
+#[test]
+fn test_tar_rejects_fifo() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with FIFO (named pipe) entry
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("my_pipe").unwrap();
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Fifo);
+    header.set_cksum();
+
+    builder.append(&header, &[][..]).unwrap();
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path()).unwrap().extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::UnsupportedEntryType { .. }),
+        "Expected UnsupportedEntryType, got {:?}",
+        err
+    );
+
+    println!("✅ TAR rejects FIFO");
+}
+
+#[test]
+fn test_tar_blocks_absolute_path() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with absolute path by manually setting header bytes
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("placeholder").unwrap();
+    header.set_size(4);
+    header.set_mode(0o644);
+
+    // Inject absolute path
+    let evil_path = b"/etc/passwd";
+    header.as_mut_bytes()[..evil_path.len()].copy_from_slice(evil_path);
+    header.as_mut_bytes()[evil_path.len()] = 0;
+    header.set_cksum();
+
+    builder.append(&header, &b"pwnd"[..]).unwrap();
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path()).unwrap().extract_tar(adapter);
+
+    // Should either fail or strip the leading slash (safe behavior)
+    match result {
+        Err(safe_unzip::Error::PathEscape { .. }) => {
+            println!("✅ TAR blocks absolute path (rejected)");
+        }
+        Ok(_) => {
+            // If it succeeded, verify it was extracted safely inside the jail
+            assert!(
+                !std::path::Path::new("/etc/passwd").exists()
+                    || std::fs::read_to_string("/etc/passwd")
+                        .map(|s| s != "pwnd")
+                        .unwrap_or(true),
+                "Should not have written to /etc/passwd"
+            );
+            // Should be inside the jail with leading slash stripped
+            assert!(
+                dest.path().join("etc/passwd").exists()
+                    || dest.path().join("passwd").exists(),
+                "Should be extracted inside jail"
+            );
+            println!("✅ TAR blocks absolute path (sanitized)");
+        }
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[test]
+fn test_tar_symlink_skip_policy() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with symlink
+    let mut builder = tar::Builder::new(Vec::new());
+
+    // Regular file
+    let mut header = tar::Header::new_gnu();
+    header.set_path("regular.txt").unwrap();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, &b"safe"[..]).unwrap();
+
+    // Symlink
+    let mut header = tar::Header::new_gnu();
+    header.set_path("link").unwrap();
+    header.set_size(0);
+    header.set_mode(0o777);
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_link_name("/etc/passwd").unwrap();
+    header.set_cksum();
+    builder.append(&header, &[][..]).unwrap();
+
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let report = Driver::new(dest.path())
+        .unwrap()
+        .symlinks(safe_unzip::SymlinkBehavior::Skip)
+        .extract_tar(adapter)
+        .unwrap();
+
+    // Regular file should be extracted, symlink should be skipped
+    assert_eq!(report.files_extracted, 1);
+    assert_eq!(report.entries_skipped, 1);
+    assert!(dest.path().join("regular.txt").exists());
+    assert!(!dest.path().join("link").exists());
+
+    println!("✅ TAR symlink skip policy works");
+}
+
+#[test]
+fn test_tar_symlink_error_policy() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with symlink
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("evil_link").unwrap();
+    header.set_size(0);
+    header.set_mode(0o777);
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_link_name("/etc/shadow").unwrap();
+    header.set_cksum();
+    builder.append(&header, &[][..]).unwrap();
+
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path())
+        .unwrap()
+        .symlinks(safe_unzip::SymlinkBehavior::Error)
+        .extract_tar(adapter);
+
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        safe_unzip::Error::SymlinkNotAllowed { .. }
+    ));
+
+    println!("✅ TAR symlink error policy works");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_tar_strips_setuid_setgid() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with setuid/setgid file
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_path("suid_binary").unwrap();
+    header.set_size(4);
+    // 0o4755 = setuid + rwxr-xr-x
+    // 0o2755 = setgid + rwxr-xr-x
+    // 0o6755 = both setuid and setgid
+    header.set_mode(0o6755);
+    header.set_cksum();
+
+    builder.append(&header, &b"exec"[..]).unwrap();
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let report = Driver::new(dest.path())
+        .unwrap()
+        .extract_tar(adapter)
+        .unwrap();
+
+    assert_eq!(report.files_extracted, 1);
+
+    // Verify permissions were stripped to 0o755 or lower (no setuid/setgid)
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(dest.path().join("suid_binary")).unwrap();
+    let mode = metadata.permissions().mode();
+
+    // Check that setuid (0o4000) and setgid (0o2000) bits are NOT set
+    assert!(
+        mode & 0o6000 == 0,
+        "setuid/setgid bits should be stripped, got mode {:o}",
+        mode
+    );
+
+    println!("✅ TAR strips setuid/setgid bits");
+}
+
+#[test]
+fn test_tar_size_limit_enforcement() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with file larger than limit
+    let large_content = vec![b'X'; 1024 * 1024]; // 1 MB
+    let tar_data = create_simple_tar("large.bin", &large_content);
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path())
+        .unwrap()
+        .limits(Limits {
+            max_total_bytes: 512 * 1024, // 512 KB limit
+            ..Default::default()
+        })
+        .extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::TotalSizeExceeded { .. }),
+        "Expected TotalSizeExceeded, got {:?}",
+        err
+    );
+
+    println!("✅ TAR size limit enforcement works");
+}
+
+#[test]
+fn test_tar_single_file_size_limit() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with file exceeding single file limit
+    let large_content = vec![b'Y'; 100 * 1024]; // 100 KB
+    let tar_data = create_simple_tar("big.bin", &large_content);
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path())
+        .unwrap()
+        .limits(Limits {
+            max_single_file: 50 * 1024, // 50 KB limit
+            ..Default::default()
+        })
+        .extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::FileTooLarge { .. }),
+        "Expected FileTooLarge, got {:?}",
+        err
+    );
+
+    println!("✅ TAR single file size limit works");
+}
+
+#[test]
+fn test_tar_file_count_limit() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with many files
+    let files: Vec<(&str, &[u8])> = vec![
+        ("a.txt", b"a"),
+        ("b.txt", b"b"),
+        ("c.txt", b"c"),
+        ("d.txt", b"d"),
+        ("e.txt", b"e"),
+    ];
+    let tar_data = create_multi_file_tar(&files);
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path())
+        .unwrap()
+        .limits(Limits {
+            max_file_count: 3, // Only allow 3 files
+            ..Default::default()
+        })
+        .extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::FileCountExceeded { .. }),
+        "Expected FileCountExceeded, got {:?}",
+        err
+    );
+
+    println!("✅ TAR file count limit works");
+}
+
+#[test]
+fn test_tar_depth_limit() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with deeply nested file
+    let mut builder = tar::Builder::new(Vec::new());
+    let deep_path = "a/b/c/d/e/f/g/h/i/j/deep.txt";
+
+    let mut header = tar::Header::new_gnu();
+    header.set_path(deep_path).unwrap();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, &b"deep"[..]).unwrap();
+
+    let tar_data = builder.into_inner().unwrap();
+
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let result = Driver::new(dest.path())
+        .unwrap()
+        .limits(Limits {
+            max_path_depth: 3, // Only allow 3 levels
+            ..Default::default()
+        })
+        .extract_tar(adapter);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, safe_unzip::Error::PathTooDeep { .. }),
+        "Expected PathTooDeep, got {:?}",
+        err
+    );
+
+    println!("✅ TAR depth limit works");
+}
+
+#[test]
+fn test_tar_hard_link_treated_as_symlink() {
+    let dest = tempdir().unwrap();
+
+    // Create tar with hard link (tar::EntryType::Link)
+    let mut builder = tar::Builder::new(Vec::new());
+
+    // First add a regular file
+    let mut header = tar::Header::new_gnu();
+    header.set_path("original.txt").unwrap();
+    header.set_size(5);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, &b"hello"[..]).unwrap();
+
+    // Then add a hard link to it (inside the tar)
+    let mut header = tar::Header::new_gnu();
+    header.set_path("hardlink.txt").unwrap();
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Link);
+    header.set_link_name("original.txt").unwrap();
+    header.set_cksum();
+    builder.append(&header, &[][..]).unwrap();
+
+    let tar_data = builder.into_inner().unwrap();
+
+    // With skip policy, hard link should be skipped
+    let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
+    let report = Driver::new(dest.path())
+        .unwrap()
+        .symlinks(safe_unzip::SymlinkBehavior::Skip)
+        .extract_tar(adapter)
+        .unwrap();
+
+    assert_eq!(report.files_extracted, 1);
+    assert_eq!(report.entries_skipped, 1);
+    assert!(dest.path().join("original.txt").exists());
+    assert!(!dest.path().join("hardlink.txt").exists());
+
+    println!("✅ TAR hard link handled as symlink");
 }
