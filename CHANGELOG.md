@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Async API**: Optional tokio-based async extraction via `async` feature
+  - `safe_unzip::r#async::{extract_file, extract_bytes, AsyncExtractor}`
+  - `extract_tar_file`, `extract_tar_gz_file`, `extract_tar_bytes`, `extract_tar_gz_bytes`
+  - 15 async tests covering ZIP, TAR, and concurrent extraction
+- CI now tests with `--features async`
+
 ## [0.1.2] - 2025-12-31
 
 ### Added

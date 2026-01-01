@@ -31,6 +31,9 @@ jobs:
       
       - name: Run tests
         run: cargo test --verbose
+      
+      - name: Run tests (with async feature)
+        run: cargo test --verbose --features async
 
   clippy:
     name: Clippy
@@ -45,6 +48,9 @@ jobs:
       
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
+      
+      - name: Run Clippy (with async feature)
+        run: cargo clippy --all-targets --features async -- -D warnings
 
   fmt:
     name: Format

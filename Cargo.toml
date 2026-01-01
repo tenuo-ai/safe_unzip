@@ -13,11 +13,17 @@ categories = ["filesystem", "compression"]
 [workspace]
 members = [".", "python"]
 
+[features]
+default = []
+async = ["tokio"]
+
 [dependencies]
 path_jail = "0.2"
 zip = "2.1"
 tar = "0.4"
 flate2 = "1"  # For .tar.gz support
+tokio = { version = "1", features = ["rt", "fs", "sync"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

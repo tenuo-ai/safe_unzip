@@ -8,6 +8,44 @@ mod driver;
 pub mod entry;
 pub mod policy;
 
+// Async API (requires `async` feature)
+#[cfg(feature = "async")]
+mod async_extractor;
+
+/// Async extraction API.
+///
+/// This module provides async versions of the extraction functions. Requires the
+/// `async` feature to be enabled.
+///
+/// ```toml
+/// [dependencies]
+/// safe_unzip = { version = "0.1", features = ["async"] }
+/// ```
+///
+/// # Example
+///
+/// ```no_run
+/// use safe_unzip::r#async::{extract_file, AsyncExtractor};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), safe_unzip::Error> {
+///     // Simple extraction
+///     let report = extract_file("/var/uploads", "archive.zip").await?;
+///     
+///     // With options
+///     let report = AsyncExtractor::new("/var/uploads")?
+///         .max_total_bytes(500 * 1024 * 1024)
+///         .extract_file("archive.zip")
+///         .await?;
+///     
+///     Ok(())
+/// }
+/// ```
+#[cfg(feature = "async")]
+pub mod r#async {
+    pub use crate::async_extractor::*;
+}
+
 pub use error::Error;
 pub use extractor::{EntryInfo, ExtractionMode, Extractor, OverwritePolicy, Report, SymlinkPolicy};
 pub use limits::Limits;

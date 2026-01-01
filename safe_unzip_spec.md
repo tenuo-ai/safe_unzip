@@ -46,7 +46,7 @@ Built on `path_jail` for path validation.
 
 ### v0.2 (Planned)
 
-- Async API
+- ~~Async API~~ ✅ Added in post-0.1.2 (via `async` feature)
 - Atomic extraction (temp dir, move on success)
 - Progress callback
 - More compression formats (bzip2, xz)
@@ -65,6 +65,11 @@ path_jail = "0.2"
 zip = "2.1"
 tar = "0.4"
 flate2 = "1"  # For .tar.gz support
+tokio = { version = "1", features = ["rt", "fs", "sync"], optional = true }
+
+[features]
+default = []
+async = ["tokio"]
 ```
 
 ## 5. Rust API
@@ -326,7 +331,37 @@ impl Driver {
 
 The legacy `Extractor` API remains for backward compatibility (ZIP-only).
 
-### 5.5 Error Type
+### 5.5 Async API (Feature: `async`)
+
+The `async` feature provides tokio-based async extraction:
+
+```rust
+use safe_unzip::r#async::{extract_file, AsyncExtractor};
+
+// Simple async extraction
+let report = extract_file("/var/uploads", "archive.zip").await?;
+
+// With options
+let report = AsyncExtractor::new("/var/uploads")?
+    .max_total_bytes(500 * 1024 * 1024)
+    .max_file_count(1000)
+    .extract_file("archive.zip")
+    .await?;
+
+// TAR extraction
+let report = AsyncExtractor::new("/var/uploads")?
+    .extract_tar_file("archive.tar")
+    .await?;
+```
+
+The async API uses `spawn_blocking` internally since the `zip` and `tar` crates are synchronous.
+
+Available functions:
+- `extract_file`, `extract_bytes` — ZIP
+- `extract_tar_file`, `extract_tar_gz_file`, `extract_tar_bytes`, `extract_tar_gz_bytes` — TAR
+- `AsyncExtractor` — Builder API with all the same options as `Extractor`
+
+### 5.6 Error Type
 
 ```rust
 /// Errors that can occur during archive extraction.

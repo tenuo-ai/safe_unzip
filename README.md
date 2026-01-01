@@ -73,6 +73,7 @@ If your zip files only come from trusted sources you control, the standard `zip`
 ## Features
 
 - **Multi-Format Support** — ZIP and TAR (`.tar`, `.tar.gz`) archives
+- **Async API** — Optional tokio-based async extraction (feature flag)
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
 - **Zip Bomb Protection** — Configurable limits on size, file count, and path depth
 - **Strict Size Enforcement** — Catches files that decompress larger than declared
@@ -276,6 +277,50 @@ let report = Driver::new("/var/uploads")?
 ```
 
 The new `Driver` API provides a unified interface for all archive formats with the same security guarantees.
+
+### Async Extraction (New)
+
+Enable the `async` feature for tokio-based async extraction:
+
+```toml
+[dependencies]
+safe_unzip = { version = "0.1", features = ["async"] }
+```
+
+```rust
+use safe_unzip::r#async::{extract_file, extract_tar_file, AsyncExtractor};
+
+#[tokio::main]
+async fn main() -> Result<(), safe_unzip::Error> {
+    // Simple async extraction
+    let report = extract_file("/var/uploads", "archive.zip").await?;
+    
+    // TAR extraction
+    let report = extract_tar_file("/var/uploads", "archive.tar").await?;
+    
+    // With options
+    let report = AsyncExtractor::new("/var/uploads")?
+        .max_total_bytes(500 * 1024 * 1024)
+        .max_file_count(1000)
+        .extract_file("archive.zip")
+        .await?;
+    
+    Ok(())
+}
+```
+
+Concurrent extraction of multiple archives:
+
+```rust
+use safe_unzip::r#async::{extract_file, extract_tar_bytes};
+
+let (zip_result, tar_result) = tokio::join!(
+    extract_file("/uploads/a", "first.zip"),
+    extract_tar_bytes("/uploads/b", tar_data),
+);
+```
+
+The async API uses `spawn_blocking` internally, so extraction runs in a thread pool without blocking the async runtime.
 
 ## Security Model
 

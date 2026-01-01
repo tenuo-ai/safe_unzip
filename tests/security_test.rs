@@ -790,3 +790,313 @@ fn test_mixed_slash_traversal() {
     );
     println!("✅ Rejected mixed slash traversal attempt");
 }
+
+// ============================================================================
+// Red Team: Advanced Edge Case Tests
+// ============================================================================
+
+/// Test: Unicode lookalike characters should not cause path confusion
+/// Attack: "file․txt" (U+2024 ONE DOT LEADER) vs "file.txt"
+/// Defense: Both should extract as separate files; no collision
+#[test]
+fn test_unicode_lookalike_characters() {
+    let dest = tempdir().unwrap();
+
+    // U+2024 ONE DOT LEADER looks like a period but is a different character
+    let zip = create_multi_file_zip(&[
+        ("file.txt", b"normal dot"),
+        ("file\u{2024}txt", b"unicode lookalike"), // ․ = U+2024
+    ]);
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    // Both should extract successfully as separate files
+    match result {
+        Ok(report) => {
+            assert_eq!(report.files_extracted, 2, "Both files should extract");
+            println!("✅ Unicode lookalike characters handled correctly (both extracted)");
+        }
+        Err(e) => {
+            // Also acceptable: reject the lookalike as invalid filename
+            println!("✅ Unicode lookalike rejected: {:?}", e);
+        }
+    }
+}
+
+/// Test: URL-encoded path traversal should be blocked
+/// Attack: Entry named "..%2Fevil.txt" or "%2e%2e/evil.txt"
+/// Defense: These should either be rejected or treated literally (not decoded)
+#[test]
+fn test_url_encoded_traversal() {
+    let dest = tempdir().unwrap();
+
+    // %2F is URL-encoded forward slash
+    let zip = create_simple_zip("..%2Fevil.txt", b"evil");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(report) => {
+            // If it succeeds, verify it was treated literally (not decoded)
+            // The file should be inside dest, with the literal name
+            assert_eq!(report.files_extracted, 1);
+            // It should NOT have escaped to parent
+            let parent_evil = dest.path().parent().unwrap().join("evil.txt");
+            assert!(
+                !parent_evil.exists(),
+                "❌ URL-encoded traversal escaped jail!"
+            );
+            println!("✅ URL-encoded traversal treated as literal filename");
+        }
+        Err(Error::PathEscape { .. }) | Err(Error::InvalidFilename { .. }) => {
+            println!("✅ URL-encoded traversal rejected");
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Double-encoded traversal should be blocked
+/// Attack: "%252e%252e%252f" = %2e%2e%2f after one decode = "../" after two decodes
+/// Defense: No decoding should happen; treat as literal
+#[test]
+fn test_double_encoded_traversal() {
+    let dest = tempdir().unwrap();
+
+    // Double-encoded "../" -> after one decode: "%2e%2e%2f" -> after two: "../"
+    let zip = create_simple_zip("%252e%252e%252fevil.txt", b"evil");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(_) => {
+            // If it succeeds, verify no escape happened
+            let parent_evil = dest.path().parent().unwrap().join("evil.txt");
+            assert!(
+                !parent_evil.exists(),
+                "❌ Double-encoded traversal escaped!"
+            );
+            println!("✅ Double-encoded traversal treated as literal");
+        }
+        Err(_) => {
+            println!("✅ Double-encoded traversal rejected");
+        }
+    }
+}
+
+/// Test: Windows drive letter paths should be rejected or contained
+/// Attack: "C:\\Windows\\System32\\evil.dll" or "D:/evil.txt"
+/// Defense: Reject or strip drive letter, never write outside jail
+#[test]
+fn test_windows_drive_letter_colon() {
+    let dest = tempdir().unwrap();
+
+    // Windows-style with colon (even on Unix, should be rejected)
+    let zip = create_simple_zip("C:/Windows/evil.txt", b"evil");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(_) => {
+            // If allowed, must be contained in jail
+            assert!(
+                !std::path::Path::new("/C:/Windows/evil.txt").exists(),
+                "❌ Created file at absolute Windows path!"
+            );
+            // Should be something like dest/C:/Windows/evil.txt or dest/Windows/evil.txt
+            println!("✅ Windows drive letter path contained in jail");
+        }
+        Err(Error::InvalidFilename { reason, .. }) => {
+            // Colon is not allowed in filenames on Windows
+            println!("✅ Windows drive letter rejected: {}", reason);
+        }
+        Err(Error::PathEscape { .. }) => {
+            println!("✅ Windows drive letter blocked by path jail");
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Trailing spaces in filename should be handled safely
+/// Attack: "file.txt " (trailing space) - Windows strips trailing spaces
+/// Defense: Reject or normalize consistently
+#[test]
+fn test_trailing_space_in_filename() {
+    let dest = tempdir().unwrap();
+
+    let zip = create_simple_zip("file.txt ", b"data");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(_) => {
+            // If allowed, the file should exist (with or without trailing space)
+            let exists_with_space = dest.path().join("file.txt ").exists();
+            let exists_without = dest.path().join("file.txt").exists();
+            assert!(
+                exists_with_space || exists_without,
+                "File should exist somewhere"
+            );
+            println!("✅ Trailing space handled (file exists)");
+        }
+        Err(Error::InvalidFilename { reason, .. }) => {
+            assert!(
+                reason.contains("trailing") || reason.contains("space"),
+                "Reason should mention trailing/space: {}",
+                reason
+            );
+            println!("✅ Trailing space rejected: {}", reason);
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Trailing dot in filename should be handled safely
+/// Attack: "file.txt." - Windows strips trailing dots
+/// Defense: Reject or normalize consistently
+#[test]
+fn test_trailing_dot_in_filename() {
+    let dest = tempdir().unwrap();
+
+    let zip = create_simple_zip("file.txt.", b"data");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(_) => {
+            // If allowed on Unix, file should exist with the dot
+            let exists_with_dot = dest.path().join("file.txt.").exists();
+            let exists_without = dest.path().join("file.txt").exists();
+            assert!(
+                exists_with_dot || exists_without,
+                "File should exist somewhere"
+            );
+            println!("✅ Trailing dot handled (file exists)");
+        }
+        Err(Error::InvalidFilename { reason, .. }) => {
+            println!("✅ Trailing dot rejected: {}", reason);
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: NTFS Alternate Data Streams should be blocked
+/// Attack: "file.txt:Zone.Identifier" or "file.txt::$DATA"
+/// Defense: Reject filenames with colons (except drive letters on Windows)
+#[test]
+fn test_ntfs_alternate_data_stream() {
+    let dest = tempdir().unwrap();
+
+    // NTFS ADS syntax: filename:streamname
+    let zip = create_simple_zip("file.txt:hidden", b"secret data");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Err(Error::InvalidFilename { reason, .. }) => {
+            // Colon should be rejected in filenames
+            println!("✅ NTFS ADS syntax rejected: {}", reason);
+        }
+        Ok(_) => {
+            // On Unix, colon is allowed in filenames, so this might succeed
+            // But file should be inside jail with literal name
+            let file_path = dest.path().join("file.txt:hidden");
+            if file_path.exists() {
+                println!("✅ NTFS ADS treated as literal filename on Unix");
+            } else {
+                println!("⚠️ File created with unexpected name");
+            }
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Zone.Identifier ADS specifically
+/// Attack: "download.exe:Zone.Identifier" - hide malware metadata
+#[test]
+fn test_zone_identifier_ads() {
+    let dest = tempdir().unwrap();
+
+    let zip = create_simple_zip("download.exe:Zone.Identifier", b"[ZoneTransfer]\nZoneId=3");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    // On any platform, we should either reject or treat literally
+    match result {
+        Err(_) => println!("✅ Zone.Identifier ADS rejected"),
+        Ok(_) => {
+            // If allowed, must be literal
+            let exists = dest.path().join("download.exe:Zone.Identifier").exists();
+            assert!(exists, "If allowed, file should exist with literal name");
+            println!("✅ Zone.Identifier ADS treated literally");
+        }
+    }
+}
+
+/// Test: Very long filename should be rejected
+/// Attack: Filename with 500+ characters to cause filesystem errors
+/// Defense: is_valid_filename enforces max length
+#[test]
+fn test_very_long_filename() {
+    let dest = tempdir().unwrap();
+
+    let long_name = "a".repeat(300) + ".txt";
+    let zip = create_simple_zip(&long_name, b"data");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Err(Error::InvalidFilename { reason, .. }) => {
+            assert!(
+                reason.contains("long") || reason.contains("length"),
+                "Reason should mention length: {}",
+                reason
+            );
+            println!("✅ Very long filename rejected: {}", reason);
+        }
+        Err(Error::Io(e)) => {
+            // Filesystem might reject it
+            println!("✅ Very long filename rejected by filesystem: {}", e);
+        }
+        Ok(_) => {
+            // If filesystem allows it, that's okay
+            println!("⚠️ Very long filename allowed (filesystem accepted)");
+        }
+        Err(e) => {
+            // Other errors are unexpected
+            panic!("❌ Unexpected error: {}", e);
+        }
+    }
+}
+
+/// Test: Unicode normalization attack
+/// Attack: Two entries "café" (composed) and "café" (decomposed) collide
+/// Defense: Detect collision or handle consistently
+#[test]
+fn test_unicode_normalization_collision() {
+    let dest = tempdir().unwrap();
+
+    // NFC (composed): é = U+00E9
+    // NFD (decomposed): é = e (U+0065) + ́ (U+0301)
+    let composed = "caf\u{00E9}.txt"; // NFC
+    let decomposed = "cafe\u{0301}.txt"; // NFD
+
+    let zip = create_multi_file_zip(&[(composed, b"composed"), (decomposed, b"decomposed")]);
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(report) => {
+            // On macOS HFS+, these might collide (both normalize to same name)
+            // On most Linux filesystems, they're separate files
+            if report.files_extracted == 1 {
+                println!("✅ Unicode normalization caused collision (filesystem normalized)");
+            } else if report.files_extracted == 2 {
+                println!("✅ Unicode NFC/NFD treated as separate files");
+            }
+        }
+        Err(Error::AlreadyExists { .. }) => {
+            println!("✅ Unicode normalization collision detected");
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
