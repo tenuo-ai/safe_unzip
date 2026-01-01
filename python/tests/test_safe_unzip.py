@@ -479,3 +479,98 @@ def test_tar_validate_first_mode(tmp_path):
     # Nothing should be extracted in validate_first mode
     assert not (tmp_path / "good.txt").exists()
 
+
+# ============================================================================
+# Edge Case Tests
+# ============================================================================
+
+def test_empty_zip_archive(tmp_path):
+    """Test that empty ZIP archives are handled correctly."""
+    import zipfile
+    
+    # Create empty zip
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        pass  # No files added
+    
+    report = Extractor(tmp_path).extract_bytes(buf.getvalue())
+    assert report.files_extracted == 0
+    assert report.bytes_written == 0
+
+
+def test_directory_only_zip(tmp_path):
+    """Test ZIP with only directory entries."""
+    import zipfile
+    
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        # Add directory entries (trailing slash)
+        zf.writestr("dir1/", "")
+        zf.writestr("dir1/subdir/", "")
+        zf.writestr("dir2/", "")
+    
+    report = Extractor(tmp_path).extract_bytes(buf.getvalue())
+    assert report.files_extracted == 0  # No files, only dirs
+    assert (tmp_path / "dir1").is_dir()
+    assert (tmp_path / "dir1" / "subdir").is_dir()
+    assert (tmp_path / "dir2").is_dir()
+
+
+def test_empty_tar_archive(tmp_path):
+    """Test that empty TAR archives are handled correctly."""
+    # Create empty tar
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as tar:
+        pass  # No files added
+    
+    report = Extractor(tmp_path).extract_tar_bytes(buf.getvalue())
+    assert report.files_extracted == 0
+    assert report.bytes_written == 0
+
+
+def test_zero_size_limit(tmp_path):
+    """Test that zero size limit rejects all files."""
+    zip_data = create_simple_zip("tiny.txt", b"x")
+    
+    with pytest.raises(QuotaError):
+        (Extractor(tmp_path)
+         .max_total_mb(0)
+         .extract_bytes(zip_data))
+
+
+def test_zero_file_count_limit(tmp_path):
+    """Test that zero file count limit rejects all files."""
+    zip_data = create_simple_zip("tiny.txt", b"x")
+    
+    with pytest.raises(QuotaError):
+        (Extractor(tmp_path)
+         .max_files(0)
+         .extract_bytes(zip_data))
+
+
+def test_zero_single_file_limit(tmp_path):
+    """Test that zero single file limit rejects all files."""
+    zip_data = create_simple_zip("tiny.txt", b"x")
+    
+    with pytest.raises(QuotaError):
+        (Extractor(tmp_path)
+         .max_single_file_mb(0)
+         .extract_bytes(zip_data))
+
+
+def test_very_deep_nesting_tar(tmp_path):
+    """Test TAR with many levels of nesting."""
+    # Create deeply nested path
+    deep_path = "/".join(["d"] * 30) + "/file.txt"
+    tar_data = create_simple_tar(deep_path, b"deep")
+    
+    # Default depth limit is 50, so 30 should pass
+    report = Extractor(tmp_path).extract_tar_bytes(tar_data)
+    assert report.files_extracted == 1
+    
+    # With strict limit, should fail
+    with pytest.raises(QuotaError):
+        (Extractor(tmp_path)
+         .max_depth(10)
+         .extract_tar_bytes(tar_data))
+
