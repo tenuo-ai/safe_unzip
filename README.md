@@ -7,13 +7,12 @@ Archive extraction that won't ruin your day. Supports **ZIP** and **TAR** format
 Zip files can contain malicious paths that escape the extraction directory:
 
 ```python
-# Python 3.12, tested January 2025 — STILL VULNERABLE
 import zipfile
 zipfile.ZipFile("evil.zip").extractall("/var/uploads")
 # Extracts ../../etc/cron.d/pwned → /etc/cron.d/pwned 💀
 ```
 
-This is [Zip Slip](https://snyk.io/research/zip-slip-vulnerability), and it **still affects Python in 2025**.
+This is [Zip Slip](https://snyk.io/research/zip-slip-vulnerability), and Python's default behavior is still vulnerable.
 
 ### "But didn't Python fix this?"
 
