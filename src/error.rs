@@ -91,7 +91,11 @@ impl fmt::Display for Error {
             }
             Self::SymlinkNotAllowed { entry, target } => {
                 if target.is_empty() {
-                    write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
+                    write!(
+                        f,
+                        "archive contains symlink '{}' (symlinks not allowed)",
+                        entry
+                    )
                 } else {
                     write!(
                         f,

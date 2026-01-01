@@ -392,8 +392,7 @@ fn test_tar_blocks_absolute_path() {
             );
             // Should be inside the jail with leading slash stripped
             assert!(
-                dest.path().join("etc/passwd").exists()
-                    || dest.path().join("passwd").exists(),
+                dest.path().join("etc/passwd").exists() || dest.path().join("passwd").exists(),
                 "Should be extracted inside jail"
             );
             println!("✅ TAR blocks absolute path (sanitized)");

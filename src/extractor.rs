@@ -241,7 +241,7 @@ impl Extractor {
                         return Err(Error::SymlinkNotAllowed {
                             entry: name,
                             target: String::new(), // ZIP symlink targets require reading content
-                        })
+                        });
                     }
                     SymlinkPolicy::Skip => {
                         report.entries_skipped += 1;
