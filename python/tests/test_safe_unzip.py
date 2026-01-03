@@ -849,3 +849,109 @@ def test_context_manager_exception_propagates(tmp_path):
         with Extractor(tmp_path) as ext:
             raise CustomError("test error")
 
+
+# ============================================================================
+# Filtering Tests
+# ============================================================================
+
+def test_only_filter(tmp_path):
+    """Test extracting only specific files by name."""
+    zip_data = create_multi_file_zip({
+        "readme.txt": b"readme",
+        "license.txt": b"license",
+        "code.py": b"code",
+    })
+    
+    report = (
+        Extractor(tmp_path)
+        .only(["readme.txt", "license.txt"])
+        .extract_bytes(zip_data)
+    )
+    
+    assert report.files_extracted == 2
+    assert report.entries_skipped == 1
+    assert (tmp_path / "readme.txt").exists()
+    assert (tmp_path / "license.txt").exists()
+    assert not (tmp_path / "code.py").exists()
+
+
+def test_include_glob_filter(tmp_path):
+    """Test include_glob pattern matching."""
+    zip_data = create_multi_file_zip({
+        "src/main.py": b"main",
+        "src/utils.py": b"utils",
+        "tests/test_main.py": b"test",
+        "readme.md": b"readme",
+    })
+    
+    report = (
+        Extractor(tmp_path)
+        .include_glob(["**/*.py"])
+        .extract_bytes(zip_data)
+    )
+    
+    assert report.files_extracted == 3
+    assert report.entries_skipped == 1
+    assert (tmp_path / "src/main.py").exists()
+    assert (tmp_path / "tests/test_main.py").exists()
+    assert not (tmp_path / "readme.md").exists()
+
+
+def test_exclude_glob_filter(tmp_path):
+    """Test exclude_glob pattern matching."""
+    zip_data = create_multi_file_zip({
+        "src/main.py": b"main",
+        "src/__pycache__/main.pyc": b"cache",
+        "tests/test_main.py": b"test",
+    })
+    
+    report = (
+        Extractor(tmp_path)
+        .exclude_glob(["**/__pycache__/**"])
+        .extract_bytes(zip_data)
+    )
+    
+    assert report.files_extracted == 2
+    assert report.entries_skipped == 1
+    assert (tmp_path / "src/main.py").exists()
+    assert not (tmp_path / "src/__pycache__/main.pyc").exists()
+
+
+def test_only_filter_on_tar(tmp_path):
+    """Test only filter on TAR archives."""
+    tar_data = create_multi_file_tar({
+        "a.txt": b"aaa",
+        "b.txt": b"bbb",
+        "c.txt": b"ccc",
+    })
+    
+    report = (
+        Extractor(tmp_path)
+        .only(["a.txt", "c.txt"])
+        .extract_tar_bytes(tar_data)
+    )
+    
+    assert report.files_extracted == 2
+    assert (tmp_path / "a.txt").exists()
+    assert not (tmp_path / "b.txt").exists()
+    assert (tmp_path / "c.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_async_filter(tmp_path):
+    """Test filtering with async extractor."""
+    zip_data = create_multi_file_zip({
+        "keep.txt": b"keep",
+        "skip.txt": b"skip",
+    })
+    
+    report = await (
+        AsyncExtractor(tmp_path)
+        .only(["keep.txt"])
+        .extract_bytes(zip_data)
+    )
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "keep.txt").exists()
+    assert not (tmp_path / "skip.txt").exists()
+

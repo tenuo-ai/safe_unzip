@@ -94,6 +94,23 @@ pub struct EntryInfo<'a> {
     pub is_symlink: bool,
 }
 
+/// Progress information passed to callbacks.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    /// Name of the current entry being processed.
+    pub entry_name: String,
+    /// Size of the current entry in bytes.
+    pub entry_size: u64,
+    /// Index of the current entry (0-based).
+    pub entry_index: usize,
+    /// Total number of entries in the archive.
+    pub total_entries: usize,
+    /// Bytes written so far (cumulative).
+    pub bytes_written: u64,
+    /// Files extracted so far.
+    pub files_extracted: usize,
+}
+
 pub struct Extractor {
     root: std::path::PathBuf,
     jail: Jail,
@@ -104,6 +121,9 @@ pub struct Extractor {
     // Using a boxed closure for the filter
     #[allow(clippy::type_complexity)]
     filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
+    // Progress callback
+    #[allow(clippy::type_complexity)]
+    on_progress: Option<Box<dyn Fn(&Progress) + Send + Sync>>,
 }
 
 impl Extractor {
@@ -166,6 +186,7 @@ impl Extractor {
             symlinks: SymlinkPolicy::default(),
             mode: ExtractionMode::default(),
             filter: None,
+            on_progress: None,
         })
     }
 
@@ -197,6 +218,114 @@ impl Extractor {
         self
     }
 
+    /// Extract only specific files by exact name.
+    ///
+    /// This is useful for extracting a known subset of files from an archive.
+    /// Names are matched exactly (case-sensitive).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// // Extract only README and LICENSE
+    /// let report = Extractor::new("/tmp/out")?
+    ///     .only(&["README.md", "LICENSE"])
+    ///     .extract_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn only<S: AsRef<str>>(self, names: &[S]) -> Self {
+        let names: Vec<String> = names.iter().map(|s| s.as_ref().to_string()).collect();
+        self.filter(move |entry| names.iter().any(|n| n == entry.name))
+    }
+
+    /// Include only files matching a glob pattern.
+    ///
+    /// Patterns use standard glob syntax: `*` matches any characters except `/`,
+    /// `**` matches any characters including `/`, `?` matches a single character.
+    ///
+    /// Multiple patterns can be specified; a file is included if it matches ANY pattern.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// // Extract only Rust source files
+    /// let report = Extractor::new("/tmp/out")?
+    ///     .include_glob(&["**/*.rs"])
+    ///     .extract_file("code.zip")?;
+    ///
+    /// // Multiple patterns: images or docs
+    /// let report = Extractor::new("/tmp/out")?
+    ///     .include_glob(&["**/*.jpg", "**/*.png", "docs/**"])
+    ///     .extract_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn include_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
+        let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
+        self.filter(move |entry| {
+            patterns
+                .iter()
+                .any(|p| glob_match::glob_match(p, entry.name))
+        })
+    }
+
+    /// Exclude files matching a glob pattern.
+    ///
+    /// Patterns use standard glob syntax. A file is extracted only if it does NOT
+    /// match ANY of the exclude patterns.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// // Extract everything except tests
+    /// let report = Extractor::new("/tmp/out")?
+    ///     .exclude_glob(&["**/test_*", "**/tests/**"])
+    ///     .extract_file("code.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn exclude_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
+        let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
+        self.filter(move |entry| {
+            !patterns
+                .iter()
+                .any(|p| glob_match::glob_match(p, entry.name))
+        })
+    }
+
+    /// Set a progress callback.
+    ///
+    /// The callback is called before processing each entry, allowing you to
+    /// display progress bars, log extraction progress, or implement cancellation.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// let report = Extractor::new("/tmp/out")?
+    ///     .on_progress(|p| {
+    ///         println!("[{}/{}] {} ({} bytes)",
+    ///             p.entry_index + 1,
+    ///             p.total_entries,
+    ///             p.entry_name,
+    ///             p.entry_size
+    ///         );
+    ///     })
+    ///     .extract_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn on_progress<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&Progress) + Send + Sync + 'static,
+    {
+        self.on_progress = Some(Box::new(callback));
+        self
+    }
+
     pub fn extract<R: Read + Seek>(&self, reader: R) -> Result<Report, Error> {
         let mut archive = zip::ZipArchive::new(reader)?;
 
@@ -207,11 +336,23 @@ impl Extractor {
 
         let mut report = Report::default();
         let mut total_bytes_written: u64 = 0;
+        let total_entries = archive.len();
 
-        for i in 0..archive.len() {
+        for i in 0..total_entries {
             let mut entry = archive.by_index(i)?;
             let name = entry.name().to_string();
-            // println!("DEBUG: Processing entry: {}", name);
+
+            // Call progress callback if set
+            if let Some(ref callback) = self.on_progress {
+                callback(&Progress {
+                    entry_name: name.clone(),
+                    entry_size: entry.size(),
+                    entry_index: i,
+                    total_entries,
+                    bytes_written: total_bytes_written,
+                    files_extracted: report.files_extracted,
+                });
+            }
 
             // 0. SECURITY: Filename Sanitization
             if let Err(reason) = self.validate_filename(&name) {

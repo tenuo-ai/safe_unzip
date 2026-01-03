@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-01-03
+
+### Added
+
+- **Partial Extraction**: Extract specific files by name or pattern
+  - `only(&["file1", "file2"])` — extract specific files by exact name
+  - `include_glob(&["**/*.py"])` — include files matching glob patterns
+  - `exclude_glob(&["**/__pycache__/**"])` — exclude files matching patterns
+  - Available on `Extractor`, `Driver`, and `AsyncExtractor`
+  - Full Python bindings support
+
+- **Progress Callbacks**: Monitor extraction progress
+  - `on_progress(callback)` with entry name, size, index, totals
+  - Rust: `Progress` struct, Python: dict with same fields
+  - Full Python bindings support (callbacks run in thread pool)
+
+- **7z Support** (feature-gated): Read-only 7z extraction
+  - `Driver::extract_7z_file()`, `extract_7z_bytes()`
+  - `SevenZAdapter` for low-level access
+  - Enable with `features = ["sevenz"]`
+  - Python bindings included when sevenz feature enabled
+
+- **Optional TAR Support**: TAR/FLATE2 are now optional dependencies via `tar` feature flag
+  - Default: ZIP only (~30 deps)
+  - With `tar` feature: ~40 deps
+  - Python bindings always enable `tar` for full feature parity
+
+### Changed
+
+- `tar` and `flate2` dependencies are now optional (gated behind `tar` feature)
+- `default = []` — only ZIP included by default (breaking if you used TAR without feature flag)
+- Python bindings explicitly enable `tar` and `sevenz` features
+
 ## [0.1.4] - 2026-01-02
 
 ### Added

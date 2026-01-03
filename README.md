@@ -1,6 +1,6 @@
 # safe_unzip
 
-Archive extraction that won't ruin your day. Supports **ZIP** and **TAR** formats.
+Secure archive extraction. Supports **ZIP** (core), **TAR**, and **7z** (optional features).
 
 ## The Problem
 
@@ -72,7 +72,9 @@ If your zip files only come from trusted sources you control, the standard `zip`
 
 ## Features
 
-- **Multi-Format Support** — ZIP and TAR (`.tar`, `.tar.gz`) archives
+- **Multi-Format Support** — ZIP (core), TAR, and 7z (feature flags)
+- **Partial Extraction** — Extract specific files with `only()` or glob patterns
+- **Progress Callbacks** — Monitor extraction progress (Rust API)
 - **Async API** — Optional tokio-based async extraction (feature flag)
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
 - **Zip Bomb Protection** — Configurable limits on size, file count, and path depth
@@ -98,6 +100,30 @@ safe_unzip = "0.1"
 ```bash
 pip install safe-unzip
 ```
+
+### Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `tar` | ❌ | TAR/TAR.GZ extraction |
+| `async` | ❌ | Tokio-based async API |
+| `sevenz` | ❌ | 7z extraction (heavier deps) |
+
+```toml
+# ZIP only (smallest, ~30 deps)
+safe_unzip = "0.1"
+
+# With TAR support (~40 deps)
+safe_unzip = { version = "0.1", features = ["tar"] }
+
+# With async API
+safe_unzip = { version = "0.1", features = ["async"] }
+
+# Kitchen sink (~85 deps)
+safe_unzip = { version = "0.1", features = ["tar", "async", "sevenz"] }
+```
+
+> **Note:** Python bindings always include TAR support.
 
 ### Python Bindings
 
@@ -182,6 +208,82 @@ println!("Extracted {} images, skipped {} other files",
     report.files_extracted,
     report.entries_skipped
 );
+```
+
+### Partial Extraction (New in v0.1.5)
+
+Extract specific files by name or glob pattern:
+
+```rust
+use safe_unzip::Extractor;
+
+// Extract only specific files
+let report = Extractor::new("/var/uploads")?
+    .only(&["README.md", "LICENSE"])
+    .extract_file("archive.zip")?;
+
+// Include by glob pattern
+let report = Extractor::new("/var/uploads")?
+    .include_glob(&["**/*.py", "**/*.rs"])
+    .extract_file("archive.zip")?;
+
+// Exclude by glob pattern
+let report = Extractor::new("/var/uploads")?
+    .exclude_glob(&["**/__pycache__/**", "**/*.pyc"])
+    .extract_file("archive.zip")?;
+```
+
+**Python:**
+```python
+from safe_unzip import Extractor
+
+# Extract only specific files
+report = Extractor("/var/uploads").only(["README.md", "LICENSE"]).extract_file("archive.zip")
+
+# Include by pattern
+report = Extractor("/var/uploads").include_glob(["**/*.py"]).extract_file("archive.zip")
+
+# Exclude by pattern  
+report = Extractor("/var/uploads").exclude_glob(["**/__pycache__/**"]).extract_file("archive.zip")
+```
+
+### Progress Callbacks
+
+Monitor extraction progress:
+
+```rust
+use safe_unzip::Extractor;
+
+let report = Extractor::new("/var/uploads")?
+    .on_progress(|p| {
+        println!("[{}/{}] {} ({} bytes)",
+            p.entry_index + 1,
+            p.total_entries,
+            p.entry_name,
+            p.entry_size
+        );
+    })
+    .extract_file("archive.zip")?;
+```
+
+**Python:**
+```python
+from safe_unzip import Extractor
+
+def show_progress(p):
+    print(f"[{p['entry_index']+1}/{p['total_entries']}] {p['entry_name']}")
+
+Extractor("/var/uploads").on_progress(show_progress).extract_file("archive.zip")
+
+# Or with tqdm for a progress bar
+from tqdm import tqdm
+entries = list_zip_entries("archive.zip")
+pbar = tqdm(total=len(entries))
+def update_bar(p):
+    pbar.update(1)
+    pbar.set_description(p['entry_name'])
+Extractor("/var/uploads").on_progress(update_bar).extract_file("archive.zip")
+pbar.close()
 ```
 
 ### Overwrite Policies
@@ -277,6 +379,40 @@ let report = Driver::new("/var/uploads")?
 ```
 
 The new `Driver` API provides a unified interface for all archive formats with the same security guarantees.
+
+### 7z Extraction (Requires `sevenz` Feature)
+
+Enable the `sevenz` feature:
+
+```toml
+[dependencies]
+safe_unzip = { version = "0.1", features = ["sevenz"] }
+```
+
+```rust
+use safe_unzip::{Driver, SevenZAdapter};
+
+// Extract a .7z file
+let report = Driver::new("/var/uploads")?
+    .extract_7z_file("archive.7z")?;
+
+// Or from bytes
+let report = Driver::new("/var/uploads")?
+    .extract_7z_bytes(&seven_z_bytes)?;
+```
+
+**Note:** 7z archives are fully decompressed into memory before extraction, so large archives may use significant RAM.
+
+**Python:**
+```python
+from safe_unzip import extract_7z_file, Extractor
+
+# Simple extraction
+report = extract_7z_file("/var/uploads", "archive.7z")
+
+# With options
+report = Extractor("/var/uploads").extract_7z_file("archive.7z")
+```
 
 ### Async Extraction (New)
 
@@ -425,7 +561,7 @@ match extract_file("/var/uploads", "archive.zip") {
 
 ### Format Limitations
 
-- **ZIP and TAR only** — Other formats (7z, rar) not supported
+- **ZIP, TAR, 7z only** — RAR not supported
 - **Requires seekable input for ZIP** — ZIP format requires reading the central directory at the end
 - **TAR is sequential** — TAR files are read in order; `ValidateFirst` mode caches entries in memory
 - **No encrypted archives** — See below

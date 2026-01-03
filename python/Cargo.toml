@@ -1,6 +1,6 @@
 [package]
 name = "safe_unzip_python"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tenuo-ai/safe_unzip"
@@ -12,6 +12,6 @@ name = "safe_unzip"
 crate-type = ["cdylib"]
 
 [dependencies]
-safe_unzip = { path = ".." }
+safe_unzip = { path = "..", features = ["tar", "sevenz"] }
 pyo3 = { version = "0.24", features = ["extension-module"] }
 flate2 = "1"  # For .tar.gz support

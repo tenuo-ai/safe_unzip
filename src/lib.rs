@@ -47,11 +47,15 @@ pub mod r#async {
 }
 
 pub use error::Error;
-pub use extractor::{ExtractionMode, Extractor, OverwritePolicy, Report, SymlinkPolicy};
+pub use extractor::{ExtractionMode, Extractor, OverwritePolicy, Progress, Report, SymlinkPolicy};
 pub use limits::Limits;
 
 // Re-export new types
-pub use adapter::{TarAdapter, ZipAdapter};
+#[cfg(feature = "sevenz")]
+pub use adapter::SevenZAdapter;
+#[cfg(feature = "tar")]
+pub use adapter::TarAdapter;
+pub use adapter::ZipAdapter;
 pub use driver::{Driver, ExtractionReport, OverwriteMode, ValidationMode};
 pub use entry::{Entry, EntryInfo, EntryKind};
 pub use policy::{Policy, PolicyChain, PolicyConfig, SymlinkBehavior};
@@ -169,6 +173,7 @@ pub fn list_zip<R: std::io::Read + std::io::Seek>(
 /// }
 /// # Ok::<(), safe_unzip::Error>(())
 /// ```
+#[cfg(feature = "tar")]
 pub fn list_tar_entries<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<Vec<entry::EntryInfo>, Error> {
@@ -178,6 +183,7 @@ pub fn list_tar_entries<P: AsRef<std::path::Path>>(
 }
 
 /// List entries in a gzip-compressed TAR archive.
+#[cfg(feature = "tar")]
 pub fn list_tar_gz_entries<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<Vec<entry::EntryInfo>, Error> {
@@ -188,6 +194,7 @@ pub fn list_tar_gz_entries<P: AsRef<std::path::Path>>(
 }
 
 /// List entries in a TAR archive from a reader.
+#[cfg(feature = "tar")]
 pub fn list_tar<R: std::io::Read>(reader: R) -> Result<Vec<entry::EntryInfo>, Error> {
     let mut entries = Vec::new();
     let mut archive = tar::Archive::new(reader);

@@ -144,6 +144,56 @@ class Extractor:
         self._inner.mode(mode)
         return self
     
+    # Filter methods
+    def only(self, names: list[str]) -> "Extractor":
+        """Extract only specific files by exact name (case-sensitive).
+        
+        Example:
+            extractor.only(["README.md", "LICENSE"]).extract_file("archive.zip")
+        """
+        self._inner.only(names)
+        return self
+    
+    def include_glob(self, patterns: list[str]) -> "Extractor":
+        """Include only files matching glob patterns.
+        
+        Patterns: `*` matches except `/`, `**` matches including `/`, `?` matches one char.
+        
+        Example:
+            extractor.include_glob(["**/*.py"]).extract_file("archive.zip")
+        """
+        self._inner.include_glob(patterns)
+        return self
+    
+    def exclude_glob(self, patterns: list[str]) -> "Extractor":
+        """Exclude files matching glob patterns.
+        
+        Example:
+            extractor.exclude_glob(["**/__pycache__/**"]).extract_file("archive.zip")
+        """
+        self._inner.exclude_glob(patterns)
+        return self
+    
+    def on_progress(self, callback) -> "Extractor":
+        """Set a progress callback.
+        
+        The callback is called before processing each entry with a dict:
+        - entry_name: str
+        - entry_size: int  
+        - entry_index: int
+        - total_entries: int
+        - bytes_written: int
+        - files_extracted: int
+        
+        Example:
+            def show_progress(p):
+                print(f"[{p['entry_index']+1}/{p['total_entries']}] {p['entry_name']}")
+            
+            extractor.on_progress(show_progress).extract_file("archive.zip")
+        """
+        self._inner.on_progress(callback)
+        return self
+    
     # ZIP extraction
     def extract_file(self, path: _PathType) -> Report:
         """Extract a ZIP file."""
@@ -294,6 +344,31 @@ class AsyncExtractor:
     def mode(self, mode: _ExtractionMode) -> "AsyncExtractor":
         """Set extraction mode: 'streaming' or 'validate_first'."""
         self._extractor.mode(mode)
+        return self
+    
+    # Filter methods
+    def only(self, names: list[str]) -> "AsyncExtractor":
+        """Extract only specific files by exact name (case-sensitive)."""
+        self._extractor.only(names)
+        return self
+    
+    def include_glob(self, patterns: list[str]) -> "AsyncExtractor":
+        """Include only files matching glob patterns."""
+        self._extractor.include_glob(patterns)
+        return self
+    
+    def exclude_glob(self, patterns: list[str]) -> "AsyncExtractor":
+        """Exclude files matching glob patterns."""
+        self._extractor.exclude_glob(patterns)
+        return self
+    
+    def on_progress(self, callback) -> "AsyncExtractor":
+        """Set a progress callback.
+        
+        The callback is called before processing each entry with a dict.
+        Note: The callback runs in a thread pool, so it should be thread-safe.
+        """
+        self._extractor.on_progress(callback)
         return self
     
     # ZIP extraction

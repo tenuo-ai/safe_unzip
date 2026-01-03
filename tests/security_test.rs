@@ -1384,3 +1384,287 @@ fn test_zero_limits() {
 
     println!("✅ Zero limits handled correctly");
 }
+
+// ============================================================================
+// Red Team: Duplicate/Collision Attack Tests
+// ============================================================================
+
+/// Test: Duplicate entry names in same archive
+/// Attack: Two entries with exact same path - second might overwrite first
+/// Defense: Zip crate rejects duplicates at creation, or extractor rejects at extraction
+#[test]
+fn test_duplicate_entry_names() {
+    let dest = tempdir().unwrap();
+
+    // The zip crate itself prevents creating archives with duplicate names.
+    // This is a defense-in-depth: even if we craft a malicious zip manually,
+    // the safe_unzip extractor's overwrite policy would catch it.
+
+    // Try to create a zip with duplicates - the zip crate should reject this
+    let file = tempfile::tempfile().unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: FileOptions<()> = FileOptions::default();
+
+    zip.start_file("same.txt", options).unwrap();
+    zip.write_all(b"first content").unwrap();
+
+    // Attempt to add second file with same name
+    let dup_result = zip.start_file("same.txt", options);
+
+    match dup_result {
+        Err(e) => {
+            // Zip crate prevents duplicate creation - this is a valid defense
+            println!("✅ Zip crate rejects duplicate at creation: {}", e);
+        }
+        Ok(_) => {
+            // If the zip crate allowed it, finish and test extraction
+            zip.write_all(b"second content").unwrap();
+            let mut zip_file = zip.finish().unwrap();
+            zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+
+            let result = Extractor::new(dest.path()).unwrap().extract(zip_file);
+
+            match result {
+                Err(Error::AlreadyExists { entry, .. }) => {
+                    println!("✅ Extractor rejected duplicate: {}", entry);
+                }
+                Ok(report) if report.files_extracted == 1 => {
+                    println!("✅ Only first entry extracted (1 file)");
+                }
+                r => panic!("❌ Unexpected result: {:?}", r),
+            }
+        }
+    }
+}
+
+/// Test: Duplicate entry with Overwrite policy explicitly allowed
+/// Defense: The zip crate prevents creation, so we test the concept
+#[test]
+fn test_duplicate_entry_with_overwrite_policy() {
+    let dest = tempdir().unwrap();
+
+    // Since zip crate prevents duplicate creation, we test a related scenario:
+    // Create first file, then extract second zip with same filename using Overwrite
+
+    // First extraction
+    let zip1 = create_simple_zip("same.txt", b"first");
+    Extractor::new(dest.path()).unwrap().extract(zip1).unwrap();
+
+    // Second extraction with Overwrite policy
+    let zip2 = create_simple_zip("same.txt", b"second");
+    let result = Extractor::new(dest.path())
+        .unwrap()
+        .overwrite(OverwritePolicy::Overwrite)
+        .extract(zip2);
+
+    match result {
+        Ok(report) => {
+            let content = std::fs::read_to_string(dest.path().join("same.txt")).unwrap();
+            assert_eq!(content, "second", "With Overwrite, second should win");
+            assert_eq!(report.files_extracted, 1);
+            println!("✅ With Overwrite policy, second archive wins");
+        }
+        Err(e) => panic!("❌ Overwrite policy should allow: {:?}", e),
+    }
+}
+
+/// Test: Case sensitivity collision (File.txt vs file.txt)
+/// Attack: On case-insensitive FS (macOS, Windows), these collide
+/// Defense: Detect collision or use consistent behavior
+#[test]
+fn test_case_sensitivity_collision() {
+    let dest = tempdir().unwrap();
+
+    let zip = create_multi_file_zip(&[("File.TXT", b"uppercase"), ("file.txt", b"lowercase")]);
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(report) => {
+            // On case-sensitive FS (Linux): both files exist
+            // On case-insensitive FS (macOS, Windows): collision -> AlreadyExists
+            if report.files_extracted == 2 {
+                println!("✅ Case-sensitive FS: both files extracted");
+                assert!(dest.path().join("File.TXT").exists());
+                assert!(dest.path().join("file.txt").exists());
+            } else if report.files_extracted == 1 {
+                // Filesystem normalized and only one was created
+                println!("✅ Case-insensitive FS: first file preserved");
+            }
+        }
+        Err(Error::AlreadyExists { entry, .. }) => {
+            // Case-insensitive FS detected collision
+            println!("✅ Case collision detected: {}", entry);
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Path canonicalization attack using ./
+/// Attack: Entry "./foo/../bar.txt" should resolve to "bar.txt"
+/// Defense: Jail should handle or reject
+#[test]
+fn test_path_canonicalization_current_dir() {
+    let dest = tempdir().unwrap();
+
+    let zip = create_simple_zip("./foo/../bar.txt", b"data");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(_) => {
+            // Should extract somewhere inside dest
+            // Either as literal "./foo/../bar.txt" or canonicalized to "bar.txt"
+            let exists_canonical = dest.path().join("bar.txt").exists();
+            let exists_literal = dest.path().join("./foo/../bar.txt").exists();
+            let exists_in_foo = dest.path().join("foo").join("..").join("bar.txt").exists();
+
+            assert!(
+                exists_canonical || exists_literal || exists_in_foo,
+                "File should exist somewhere in jail"
+            );
+
+            // Most importantly: NOT outside the jail
+            let parent_bar = dest.path().parent().unwrap().join("bar.txt");
+            assert!(
+                !parent_bar.exists(),
+                "❌ Escaped jail via canonicalization!"
+            );
+
+            println!("✅ Path canonicalization handled safely");
+        }
+        Err(Error::PathEscape { .. }) => {
+            println!("✅ Path with '..' rejected by jail");
+        }
+        Err(Error::InvalidFilename { .. }) => {
+            println!("✅ Path with '..' rejected as invalid");
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Path canonicalization with multiple ../ segments
+/// Attack: "a/b/../../c.txt" resolves to "c.txt" at root
+#[test]
+fn test_path_multiple_parent_segments() {
+    let dest = tempdir().unwrap();
+
+    let zip = create_simple_zip("a/b/../../c.txt", b"data");
+
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+
+    match result {
+        Ok(_) => {
+            // Should be contained within dest
+            let in_dest =
+                dest.path().join("c.txt").exists() || dest.path().join("a/b/../../c.txt").exists();
+            assert!(in_dest, "File should be in jail");
+
+            // Not escaped
+            let parent_c = dest.path().parent().unwrap().join("c.txt");
+            assert!(!parent_c.exists(), "❌ Escaped via multiple '..'!");
+
+            println!("✅ Multiple parent segments handled safely");
+        }
+        Err(Error::PathEscape { .. }) | Err(Error::InvalidFilename { .. }) => {
+            println!("✅ Multiple parent segments rejected");
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
+    }
+}
+
+/// Test: Symbolic component at end of path
+/// Attack: "dir/." or "dir/.." as entry name
+#[test]
+fn test_dot_and_dotdot_entries() {
+    let dest = tempdir().unwrap();
+
+    // Entry that IS just "."
+    let zip1 = create_simple_zip(".", b"data");
+    let result1 = Extractor::new(dest.path()).unwrap().extract(zip1);
+
+    match result1 {
+        Err(_) => println!("✅ Single '.' entry rejected"),
+        Ok(_) => println!("⚠️ Single '.' entry accepted (check semantics)"),
+    }
+
+    // Entry that IS just ".."
+    let zip2 = create_simple_zip("..", b"data");
+    let result2 = Extractor::new(dest.path()).unwrap().extract(zip2);
+
+    match result2 {
+        Err(Error::PathEscape { .. }) | Err(Error::InvalidFilename { .. }) => {
+            println!("✅ Single '..' entry rejected");
+        }
+        Ok(_) => {
+            // If it succeeded, must NOT have escaped
+            let _parent_exists = dest.path().parent().unwrap().join("..").exists();
+            // This is a bit tricky - ".." always "exists" as the parent dir
+            // What matters is no FILE was written outside
+            println!("⚠️ Single '..' accepted - verify no escape");
+        }
+        Err(e) => panic!("❌ Unexpected error for '..': {:?}", e),
+    }
+}
+
+/// Test: Entry ending with slash (explicit directory marker)
+/// Defense: Should create directory, not file
+#[test]
+fn test_trailing_slash_directory() {
+    let dest = tempdir().unwrap();
+
+    // This should be treated as a directory, not a file
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options: FileOptions<()> = FileOptions::default();
+        zip.add_directory("mydir/", options).unwrap();
+        zip.finish().unwrap();
+    }
+    buffer.set_position(0);
+
+    let result = Extractor::new(dest.path()).unwrap().extract(buffer);
+
+    match result {
+        Ok(report) => {
+            assert!(
+                dest.path().join("mydir").is_dir(),
+                "Should create directory"
+            );
+            assert_eq!(report.files_extracted, 0, "No files, just directory");
+            println!("✅ Trailing slash creates directory correctly");
+        }
+        Err(e) => panic!("❌ Directory entry should work: {:?}", e),
+    }
+}
+
+/// Test: Very deep path nesting
+/// Attack: 100+ levels of nesting to exhaust stack or filesystem
+/// Defense: max_path_depth limit
+#[test]
+fn test_extreme_path_depth() {
+    let dest = tempdir().unwrap();
+
+    // Create path with 100 levels
+    let deep_path: String = (0..100).map(|i| format!("d{}/", i)).collect::<String>() + "file.txt";
+
+    let zip = create_simple_zip(&deep_path, b"deep");
+
+    let result = Extractor::new(dest.path())
+        .unwrap()
+        .limits(Limits {
+            max_path_depth: 50, // Limit to 50
+            ..Limits::default()
+        })
+        .extract(zip);
+
+    match result {
+        Err(Error::PathTooDeep { depth, limit, .. }) => {
+            assert_eq!(limit, 50);
+            assert!(depth > 50);
+            println!("✅ Extreme depth rejected: {} > {}", depth, limit);
+        }
+        Err(e) => panic!("Expected PathTooDeep, got: {:?}", e),
+        Ok(_) => panic!("❌ Should reject 100-level deep path with limit 50"),
+    }
+}

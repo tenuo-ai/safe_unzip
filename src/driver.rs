@@ -7,7 +7,9 @@ use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
-use crate::adapter::{TarAdapter, ZipAdapter};
+#[cfg(feature = "tar")]
+use crate::adapter::TarAdapter;
+use crate::adapter::ZipAdapter;
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 use crate::limits::Limits;
@@ -146,6 +148,71 @@ impl Driver {
     {
         self.filter = Some(Box::new(f));
         self
+    }
+
+    /// Extract only specific files by exact name.
+    ///
+    /// Names are matched exactly (case-sensitive).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Driver;
+    ///
+    /// let report = Driver::new("/tmp/out")?
+    ///     .only(&["README.md", "LICENSE"])
+    ///     .extract_zip_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn only<S: AsRef<str>>(self, names: &[S]) -> Self {
+        let names: Vec<String> = names.iter().map(|s| s.as_ref().to_string()).collect();
+        self.filter(move |entry| names.iter().any(|n| n == &entry.name))
+    }
+
+    /// Include only files matching glob patterns.
+    ///
+    /// Patterns: `*` matches except `/`, `**` matches including `/`, `?` matches one char.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Driver;
+    ///
+    /// // Extract only Rust source files
+    /// let report = Driver::new("/tmp/out")?
+    ///     .include_glob(&["**/*.rs"])
+    ///     .extract_zip_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn include_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
+        let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
+        self.filter(move |entry| {
+            patterns
+                .iter()
+                .any(|p| glob_match::glob_match(p, &entry.name))
+        })
+    }
+
+    /// Exclude files matching glob patterns.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Driver;
+    ///
+    /// // Extract everything except tests
+    /// let report = Driver::new("/tmp/out")?
+    ///     .exclude_glob(&["**/test_*", "**/tests/**"])
+    ///     .extract_zip_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn exclude_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
+        let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
+        self.filter(move |entry| {
+            !patterns
+                .iter()
+                .any(|p| glob_match::glob_match(p, &entry.name))
+        })
     }
 
     /// Build the policy chain from current settings.
@@ -330,13 +397,14 @@ impl Driver {
     }
 
     // =========================================================================
-    // TAR Extraction
+    // TAR Extraction (requires "tar" feature)
     // =========================================================================
 
     /// Extract a TAR archive.
     ///
-    /// For `.tar.gz` files, use [`Self::extract_tar_gz`] or wrap the reader
+    /// For `.tar.gz` files, use [`Self::extract_tar_gz_file`] or wrap the reader
     /// in `flate2::read::GzDecoder`.
+    #[cfg(feature = "tar")]
     pub fn extract_tar<R: Read>(
         &self,
         mut adapter: TarAdapter<R>,
@@ -389,6 +457,7 @@ impl Driver {
     }
 
     /// Extract a single TAR entry (streaming mode).
+    #[cfg(feature = "tar")]
     fn extract_tar_entry(
         &self,
         info: &EntryInfo,
@@ -458,6 +527,7 @@ impl Driver {
     }
 
     /// Extract a single TAR entry from cached data (ValidateFirst mode).
+    #[cfg(feature = "tar")]
     fn extract_tar_entry_data(
         &self,
         info: &EntryInfo,
@@ -524,6 +594,7 @@ impl Driver {
 
     /// Open a file for writing based on overwrite policy.
     /// Returns None if the file should be skipped.
+    #[cfg(feature = "tar")]
     fn open_for_write(
         &self,
         path: &Path,
@@ -571,14 +642,117 @@ impl Driver {
     }
 
     /// Convenience: extract TAR from a file path.
+    #[cfg(feature = "tar")]
     pub fn extract_tar_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
         let adapter = TarAdapter::open(path)?;
         self.extract_tar(adapter)
     }
 
     /// Convenience: extract gzip-compressed TAR (.tar.gz, .tgz) from a file path.
+    #[cfg(feature = "tar")]
     pub fn extract_tar_gz_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
         let adapter = TarAdapter::open_gz(path)?;
         self.extract_tar(adapter)
+    }
+
+    /// Extract a 7z archive.
+    ///
+    /// Requires the `sevenz` feature to be enabled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use safe_unzip::{Driver, SevenZAdapter};
+    ///
+    /// let adapter = SevenZAdapter::open("archive.7z")?;
+    /// let report = Driver::new("/tmp/out")?.extract_7z(adapter)?;
+    /// ```
+    #[cfg(feature = "sevenz")]
+    pub fn extract_7z(
+        &self,
+        adapter: crate::adapter::SevenZAdapter,
+    ) -> Result<ExtractionReport, Error> {
+        let policies = self.build_policies()?;
+        let mut state = ExtractionState::default();
+
+        adapter.for_each(|info, data| {
+            self.extract_7z_entry(info, data, &policies, &mut state)?;
+            Ok(true)
+        })?;
+
+        Ok(ExtractionReport {
+            files_extracted: state.files_extracted,
+            dirs_created: state.dirs_created,
+            bytes_written: state.bytes_written,
+            entries_skipped: state.entries_skipped,
+        })
+    }
+
+    /// Extract a single 7z entry.
+    #[cfg(feature = "sevenz")]
+    fn extract_7z_entry(
+        &self,
+        info: &EntryInfo,
+        data: Option<&[u8]>,
+        policies: &PolicyChain,
+        state: &mut ExtractionState,
+    ) -> Result<(), Error> {
+        // Apply filter
+        if let Some(ref filter) = self.filter {
+            if !filter(info) {
+                state.entries_skipped += 1;
+                return Ok(());
+            }
+        }
+
+        // Validate with policies
+        policies.check_all(info, state)?;
+
+        let safe_path = self.destination.join(&info.name);
+
+        match info.kind {
+            EntryKind::Directory => {
+                fs::create_dir_all(&safe_path)?;
+                state.dirs_created += 1;
+            }
+            EntryKind::File => {
+                if let Some(parent) = safe_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                let outfile = self.open_for_write(&safe_path, state)?;
+                let Some(mut outfile) = outfile else {
+                    return Ok(()); // Skipped
+                };
+
+                if let Some(bytes) = data {
+                    use std::io::Write;
+                    outfile.write_all(bytes)?;
+                    state.bytes_written += bytes.len() as u64;
+                }
+
+                state.files_extracted += 1;
+            }
+            EntryKind::Symlink { .. } => {
+                // Skip symlinks for 7z (same policy as TAR)
+                state.entries_skipped += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convenience: extract 7z from a file path.
+    #[cfg(feature = "sevenz")]
+    pub fn extract_7z_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
+        let adapter = crate::adapter::SevenZAdapter::open(path)?;
+        self.extract_7z(adapter)
+    }
+
+    /// Convenience: extract 7z from bytes.
+    #[cfg(feature = "sevenz")]
+    pub fn extract_7z_bytes(&self, data: &[u8]) -> Result<ExtractionReport, Error> {
+        let adapter = crate::adapter::SevenZAdapter::from_bytes(data)?;
+        self.extract_7z(adapter)
     }
 }

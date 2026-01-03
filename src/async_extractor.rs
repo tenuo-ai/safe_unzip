@@ -1,8 +1,8 @@
 //! Async extraction API (requires the `async` feature).
 //!
 //! This module provides async versions of the extraction functions. Since the underlying
-//! `zip` and `tar` crates are synchronous, extraction runs in a blocking thread pool
-//! via [`tokio::task::spawn_blocking`].
+//! `zip` crate (and optionally `tar` crate with the `tar` feature) are synchronous,
+//! extraction runs in a blocking thread pool via [`tokio::task::spawn_blocking`].
 //!
 //! # Example
 //!
@@ -35,9 +35,11 @@
 //!
 //! For simple scripts or sync contexts, use the regular [`crate::extract`] functions.
 
+#[cfg(feature = "tar")]
+use crate::TarAdapter;
 use crate::{
     Driver, Error, ExtractionMode, ExtractionReport, Extractor, Limits, OverwriteMode,
-    OverwritePolicy, Report, SymlinkBehavior, SymlinkPolicy, TarAdapter, ValidationMode,
+    OverwritePolicy, Report, SymlinkBehavior, SymlinkPolicy, ValidationMode,
 };
 use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
@@ -167,6 +169,7 @@ impl AsyncExtractor {
     }
 
     /// Extract a TAR file asynchronously.
+    #[cfg(feature = "tar")]
     pub async fn extract_tar_file<P: AsRef<Path>>(&self, path: P) -> Result<Report, Error> {
         let driver = self.build_driver()?;
         let path = path.as_ref().to_path_buf();
@@ -178,6 +181,7 @@ impl AsyncExtractor {
     }
 
     /// Extract a gzip-compressed TAR file asynchronously.
+    #[cfg(feature = "tar")]
     pub async fn extract_tar_gz_file<P: AsRef<Path>>(&self, path: P) -> Result<Report, Error> {
         let driver = self.build_driver()?;
         let path = path.as_ref().to_path_buf();
@@ -189,6 +193,7 @@ impl AsyncExtractor {
     }
 
     /// Extract a TAR from bytes asynchronously.
+    #[cfg(feature = "tar")]
     pub async fn extract_tar_bytes(&self, data: Vec<u8>) -> Result<Report, Error> {
         let driver = self.build_driver()?;
 
@@ -203,6 +208,7 @@ impl AsyncExtractor {
     }
 
     /// Extract a gzip-compressed TAR from bytes asynchronously.
+    #[cfg(feature = "tar")]
     pub async fn extract_tar_gz_bytes(&self, data: Vec<u8>) -> Result<Report, Error> {
         let driver = self.build_driver()?;
 
@@ -337,6 +343,7 @@ where
 ///     Ok(())
 /// }
 /// ```
+#[cfg(feature = "tar")]
 pub async fn extract_tar_file<D, F>(destination: D, file_path: F) -> Result<Report, Error>
 where
     D: AsRef<Path>,
@@ -363,6 +370,7 @@ where
 ///     Ok(())
 /// }
 /// ```
+#[cfg(feature = "tar")]
 pub async fn extract_tar_gz_file<D, F>(destination: D, file_path: F) -> Result<Report, Error>
 where
     D: AsRef<Path>,
@@ -376,6 +384,7 @@ where
 /// Extract a TAR from bytes asynchronously with default settings.
 ///
 /// Creates the destination directory if it doesn't exist.
+#[cfg(feature = "tar")]
 pub async fn extract_tar_bytes<D>(destination: D, data: Vec<u8>) -> Result<Report, Error>
 where
     D: AsRef<Path>,
@@ -388,6 +397,7 @@ where
 /// Extract a gzip-compressed TAR from bytes asynchronously with default settings.
 ///
 /// Creates the destination directory if it doesn't exist.
+#[cfg(feature = "tar")]
 pub async fn extract_tar_gz_bytes<D>(destination: D, data: Vec<u8>) -> Result<Report, Error>
 where
     D: AsRef<Path>,

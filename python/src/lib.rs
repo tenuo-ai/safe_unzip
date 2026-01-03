@@ -210,6 +210,12 @@ struct PyExtractor {
     overwrite: String,
     symlinks: String,
     mode: String,
+    // Filter options
+    only_names: Option<Vec<String>>,
+    include_patterns: Option<Vec<String>>,
+    exclude_patterns: Option<Vec<String>>,
+    // Progress callback
+    progress_callback: Option<PyObject>,
 }
 
 #[pymethods]
@@ -226,6 +232,10 @@ impl PyExtractor {
             overwrite: "error".to_string(),
             symlinks: "skip".to_string(),
             mode: "streaming".to_string(),
+            only_names: None,
+            include_patterns: None,
+            exclude_patterns: None,
+            progress_callback: None,
         }
     }
 
@@ -290,6 +300,57 @@ impl PyExtractor {
         }
     }
 
+    /// Extract only specific files by exact name.
+    ///
+    /// Names are matched exactly (case-sensitive).
+    ///
+    /// Example:
+    ///     extractor.only(["README.md", "LICENSE"]).extract_file("archive.zip")
+    fn only(mut slf: PyRefMut<'_, Self>, names: Vec<String>) -> PyRefMut<'_, Self> {
+        slf.only_names = Some(names);
+        slf
+    }
+
+    /// Include only files matching glob patterns.
+    ///
+    /// Patterns: `*` matches except `/`, `**` matches including `/`, `?` matches one char.
+    ///
+    /// Example:
+    ///     extractor.include_glob(["**/*.py"]).extract_file("archive.zip")
+    fn include_glob(mut slf: PyRefMut<'_, Self>, patterns: Vec<String>) -> PyRefMut<'_, Self> {
+        slf.include_patterns = Some(patterns);
+        slf
+    }
+
+    /// Exclude files matching glob patterns.
+    ///
+    /// Example:
+    ///     extractor.exclude_glob(["**/__pycache__/**"]).extract_file("archive.zip")
+    fn exclude_glob(mut slf: PyRefMut<'_, Self>, patterns: Vec<String>) -> PyRefMut<'_, Self> {
+        slf.exclude_patterns = Some(patterns);
+        slf
+    }
+
+    /// Set a progress callback.
+    ///
+    /// The callback is called before processing each entry with a dict containing:
+    /// - entry_name: str
+    /// - entry_size: int
+    /// - entry_index: int
+    /// - total_entries: int
+    /// - bytes_written: int
+    /// - files_extracted: int
+    ///
+    /// Example:
+    ///     def on_progress(p):
+    ///         print(f"[{p['entry_index']+1}/{p['total_entries']}] {p['entry_name']}")
+    ///     
+    ///     extractor.on_progress(on_progress).extract_file("archive.zip")
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: PyObject) -> PyRefMut<'_, Self> {
+        slf.progress_callback = Some(callback);
+        slf
+    }
+
     /// Extract from a file path.
     fn extract_file(&self, path: PathBuf) -> PyResult<PyReport> {
         let extractor = self.build_extractor()?;
@@ -338,6 +399,20 @@ impl PyExtractor {
         let report = driver.extract_tar(adapter).map_err(to_py_err)?;
         Ok(report.into())
     }
+
+    /// Extract a 7z file.
+    fn extract_7z_file(&self, path: PathBuf) -> PyResult<PyReport> {
+        let driver = self.build_driver()?;
+        let report = driver.extract_7z_file(path).map_err(to_py_err)?;
+        Ok(report.into())
+    }
+
+    /// Extract 7z from bytes.
+    fn extract_7z_bytes(&self, data: &[u8]) -> PyResult<PyReport> {
+        let driver = self.build_driver()?;
+        let report = driver.extract_7z_bytes(data).map_err(to_py_err)?;
+        Ok(report.into())
+    }
 }
 
 impl PyExtractor {
@@ -367,6 +442,35 @@ impl PyExtractor {
             _ => extractor.mode(safe_unzip::ExtractionMode::Streaming),
         };
 
+        // Apply filters
+        if let Some(ref names) = self.only_names {
+            extractor = extractor.only(names);
+        }
+        if let Some(ref patterns) = self.include_patterns {
+            extractor = extractor.include_glob(patterns);
+        }
+        if let Some(ref patterns) = self.exclude_patterns {
+            extractor = extractor.exclude_glob(patterns);
+        }
+
+        // Apply progress callback
+        if let Some(ref callback) = self.progress_callback {
+            // Clone with GIL to get a 'static PyObject
+            let callback: PyObject = Python::with_gil(|py| callback.clone_ref(py));
+            extractor = extractor.on_progress(move |progress| {
+                Python::with_gil(|py| {
+                    let dict = pyo3::types::PyDict::new(py);
+                    let _ = dict.set_item("entry_name", &progress.entry_name);
+                    let _ = dict.set_item("entry_size", progress.entry_size);
+                    let _ = dict.set_item("entry_index", progress.entry_index);
+                    let _ = dict.set_item("total_entries", progress.total_entries);
+                    let _ = dict.set_item("bytes_written", progress.bytes_written);
+                    let _ = dict.set_item("files_extracted", progress.files_extracted);
+                    let _ = callback.call1(py, (dict,));
+                });
+            });
+        }
+
         Ok(extractor)
     }
 
@@ -395,6 +499,17 @@ impl PyExtractor {
             "validate_first" => driver.validation(safe_unzip::ValidationMode::ValidateFirst),
             _ => driver.validation(safe_unzip::ValidationMode::Streaming),
         };
+
+        // Apply filters
+        if let Some(ref names) = self.only_names {
+            driver = driver.only(names);
+        }
+        if let Some(ref patterns) = self.include_patterns {
+            driver = driver.include_glob(patterns);
+        }
+        if let Some(ref patterns) = self.exclude_patterns {
+            driver = driver.exclude_glob(patterns);
+        }
 
         Ok(driver)
     }
@@ -443,6 +558,22 @@ fn extract_tar_bytes(destination: PathBuf, data: &[u8]) -> PyResult<PyReport> {
     let cursor = std::io::Cursor::new(data.to_vec());
     let adapter = safe_unzip::TarAdapter::new(cursor);
     let report = driver.extract_tar(adapter).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
+/// Extract a 7z file with default settings.
+#[pyfunction]
+fn extract_7z_file(destination: PathBuf, path: PathBuf) -> PyResult<PyReport> {
+    let driver = safe_unzip::Driver::new_or_create(&destination).map_err(to_py_err)?;
+    let report = driver.extract_7z_file(path).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
+/// Extract 7z from bytes with default settings.
+#[pyfunction]
+fn extract_7z_bytes(destination: PathBuf, data: &[u8]) -> PyResult<PyReport> {
+    let driver = safe_unzip::Driver::new_or_create(&destination).map_err(to_py_err)?;
+    let report = driver.extract_7z_bytes(data).map_err(to_py_err)?;
     Ok(report.into())
 }
 
@@ -506,6 +637,10 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_tar_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_tar_gz_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_tar_bytes, m)?)?;
+
+    // Functions - 7z extraction
+    m.add_function(wrap_pyfunction!(extract_7z_file, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_7z_bytes, m)?)?;
 
     // Functions - Listing (no extraction)
     m.add_function(wrap_pyfunction!(list_zip_entries, m)?)?;

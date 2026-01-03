@@ -2,7 +2,7 @@
 
 from os import PathLike
 from pathlib import Path
-from typing import Union, Literal, Coroutine, List, Optional
+from typing import Union, Literal, Coroutine, List, Optional, Callable
 
 _PathType = Union[str, PathLike[str], Path]
 _OverwritePolicy = Literal["error", "skip", "overwrite"]
@@ -115,6 +115,22 @@ class Extractor:
         """Set extraction mode: 'streaming' or 'validate_first'."""
         ...
     
+    def only(self, names: list[str]) -> "Extractor":
+        """Extract only specific files by exact name (case-sensitive)."""
+        ...
+    
+    def include_glob(self, patterns: list[str]) -> "Extractor":
+        """Include only files matching glob patterns."""
+        ...
+    
+    def exclude_glob(self, patterns: list[str]) -> "Extractor":
+        """Exclude files matching glob patterns."""
+        ...
+    
+    def on_progress(self, callback: Callable[[dict], None]) -> "Extractor":
+        """Set a progress callback called for each entry."""
+        ...
+    
     # ZIP extraction
     def extract_file(self, path: _PathType) -> Report:
         """Extract a ZIP file."""
@@ -193,6 +209,22 @@ class AsyncExtractor:
     
     def mode(self, mode: _ExtractionMode) -> "AsyncExtractor":
         """Set extraction mode: 'streaming' or 'validate_first'."""
+        ...
+    
+    def only(self, names: list[str]) -> "AsyncExtractor":
+        """Extract only specific files by exact name (case-sensitive)."""
+        ...
+    
+    def include_glob(self, patterns: list[str]) -> "AsyncExtractor":
+        """Include only files matching glob patterns."""
+        ...
+    
+    def exclude_glob(self, patterns: list[str]) -> "AsyncExtractor":
+        """Exclude files matching glob patterns."""
+        ...
+    
+    def on_progress(self, callback: Callable[[dict], None]) -> "AsyncExtractor":
+        """Set a progress callback called for each entry."""
         ...
     
     # ZIP extraction (async)
