@@ -62,6 +62,19 @@ class Report:
         """Number of entries skipped (symlinks, filtered, existing)."""
         ...
 
+
+class VerifyReport:
+    """Verification report."""
+    @property
+    def entries_verified(self) -> int:
+        """Number of file entries that passed CRC verification."""
+        ...
+    @property
+    def bytes_verified(self) -> int:
+        """Total bytes read and verified."""
+        ...
+
+
 class Extractor:
     """Archive extractor with security constraints. Supports ZIP and TAR.
     
@@ -336,6 +349,24 @@ def list_tar_bytes(data: bytes) -> List[EntryInfo]:
 
 
 # ============================================================================
+# Sync Verification Functions
+# ============================================================================
+
+def verify_file(path: _PathType) -> VerifyReport:
+    """Verify archive integrity by checking CRC32 for all entries.
+    
+    Reads and decompresses all file entries without writing to disk.
+    Returns VerifyReport on success, raises exception on CRC failure.
+    """
+    ...
+
+
+def verify_bytes(data: bytes) -> VerifyReport:
+    """Verify archive integrity from bytes."""
+    ...
+
+
+# ============================================================================
 # Async Listing Functions
 # ============================================================================
 
@@ -357,6 +388,24 @@ async def async_list_tar_gz_entries(path: _PathType) -> List[EntryInfo]:
 
 async def async_list_tar_bytes(data: bytes) -> List[EntryInfo]:
     """List entries in TAR bytes asynchronously without extracting."""
+    ...
+
+
+# ============================================================================
+# Async Verification Functions
+# ============================================================================
+
+async def async_verify_file(path: _PathType) -> VerifyReport:
+    """Verify archive integrity asynchronously without extracting.
+    
+    Reads and decompresses all file entries to check CRC32.
+    Returns VerifyReport on success, raises exception on CRC failure.
+    """
+    ...
+
+
+async def async_verify_bytes(data: bytes) -> VerifyReport:
+    """Verify archive integrity from bytes asynchronously."""
     ...
 
 

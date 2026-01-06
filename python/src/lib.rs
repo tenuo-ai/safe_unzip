@@ -619,6 +619,60 @@ fn list_tar_bytes(data: &[u8]) -> PyResult<Vec<PyEntryInfo>> {
 }
 
 // ============================================================================
+// Verification Report
+// ============================================================================
+
+/// Report returned by verify functions.
+#[pyclass(name = "VerifyReport")]
+#[derive(Clone)]
+struct PyVerifyReport {
+    #[pyo3(get)]
+    entries_verified: usize,
+    #[pyo3(get)]
+    bytes_verified: u64,
+}
+
+impl From<safe_unzip::VerifyReport> for PyVerifyReport {
+    fn from(r: safe_unzip::VerifyReport) -> Self {
+        Self {
+            entries_verified: r.entries_verified,
+            bytes_verified: r.bytes_verified,
+        }
+    }
+}
+
+#[pymethods]
+impl PyVerifyReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "VerifyReport(entries_verified={}, bytes_verified={})",
+            self.entries_verified, self.bytes_verified
+        )
+    }
+}
+
+// ============================================================================
+// Verification Functions
+// ============================================================================
+
+/// Verify archive integrity by checking CRC32 for all entries.
+///
+/// Reads and decompresses all file entries without writing to disk.
+/// Returns a VerifyReport on success, raises an exception on CRC failure.
+#[pyfunction]
+fn verify_file(path: PathBuf) -> PyResult<PyVerifyReport> {
+    let report = safe_unzip::verify_file(&path).map_err(to_py_err)?;
+    Ok(PyVerifyReport::from(report))
+}
+
+/// Verify archive integrity from bytes.
+#[pyfunction]
+fn verify_bytes(data: &[u8]) -> PyResult<PyVerifyReport> {
+    let report = safe_unzip::verify_bytes(data).map_err(to_py_err)?;
+    Ok(PyVerifyReport::from(report))
+}
+
+// ============================================================================
 // Module
 // ============================================================================
 
@@ -627,6 +681,7 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
     m.add_class::<PyExtractor>()?;
     m.add_class::<PyReport>()?;
+    m.add_class::<PyVerifyReport>()?;
     m.add_class::<PyEntryInfo>()?;
 
     // Functions - ZIP extraction
@@ -648,6 +703,10 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(list_tar_entries, m)?)?;
     m.add_function(wrap_pyfunction!(list_tar_gz_entries, m)?)?;
     m.add_function(wrap_pyfunction!(list_tar_bytes, m)?)?;
+
+    // Functions - Verification (no extraction)
+    m.add_function(wrap_pyfunction!(verify_file, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_bytes, m)?)?;
 
     // Exceptions
     m.add("SafeUnzipError", py.get_type::<SafeUnzipError>())?;

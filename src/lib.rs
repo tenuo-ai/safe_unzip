@@ -47,7 +47,9 @@ pub mod r#async {
 }
 
 pub use error::Error;
-pub use extractor::{ExtractionMode, Extractor, OverwritePolicy, Progress, Report, SymlinkPolicy};
+pub use extractor::{
+    ExtractionMode, Extractor, OverwritePolicy, Progress, Report, SymlinkPolicy, VerifyReport,
+};
 pub use limits::Limits;
 
 // Re-export new types
@@ -124,6 +126,30 @@ where
     let file = std::fs::File::open(file_path)?;
     let reader = std::io::BufReader::new(file);
     Extractor::new_or_create(destination)?.extract(reader)
+}
+
+/// Verify archive integrity by checking CRC32 for all entries.
+///
+/// This reads and decompresses all file entries without writing to disk.
+/// Use this to verify an archive is intact before extraction.
+///
+/// # Example
+///
+/// ```no_run
+/// let report = safe_unzip::verify_file("archive.zip")?;
+/// println!("Verified {} entries", report.entries_verified);
+/// # Ok::<(), safe_unzip::Error>(())
+/// ```
+pub fn verify_file<P: AsRef<std::path::Path>>(path: P) -> Result<VerifyReport, Error> {
+    // We need a destination for Extractor, but verify doesn't use it
+    let temp = std::env::temp_dir();
+    Extractor::new(&temp)?.verify_file(path)
+}
+
+/// Verify archive integrity from bytes.
+pub fn verify_bytes(data: &[u8]) -> Result<VerifyReport, Error> {
+    let temp = std::env::temp_dir();
+    Extractor::new(&temp)?.verify_bytes(data)
 }
 
 /// List entries in a ZIP archive without extracting.

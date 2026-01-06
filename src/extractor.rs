@@ -86,6 +86,15 @@ pub struct Report {
     pub entries_skipped: usize,
 }
 
+/// Report returned by `verify()`.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyReport {
+    /// Number of file entries that passed CRC verification.
+    pub entries_verified: usize,
+    /// Total bytes read (and CRC-verified).
+    pub bytes_verified: u64,
+}
+
 pub struct EntryInfo<'a> {
     pub name: &'a str,
     pub size: u64,
@@ -685,6 +694,90 @@ impl Extractor {
         let file = fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         self.extract(reader)
+    }
+
+    /// Verify archive integrity by reading all entries and checking CRC32.
+    ///
+    /// This method reads and decompresses all file entries (triggering CRC validation)
+    /// but does NOT write anything to disk. Use this to verify an archive is intact
+    /// before extraction.
+    ///
+    /// # Returns
+    ///
+    /// A `VerifyReport` containing the number of entries verified and total bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Any entry fails CRC32 validation
+    /// - Any entry is encrypted
+    /// - The archive is corrupted
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// let extractor = Extractor::new("/tmp/safe_dest").unwrap();
+    /// let report = extractor.verify_file("archive.zip")?;
+    /// println!("Verified {} entries, {} bytes", report.entries_verified, report.bytes_verified);
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn verify<R: Read + Seek>(&self, reader: R) -> Result<VerifyReport, Error> {
+        let mut archive = zip::ZipArchive::new(reader)?;
+        let mut entries_verified = 0usize;
+        let mut bytes_verified = 0u64;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let name = entry.name().to_string();
+
+            // Check for encrypted entries
+            if entry.encrypted() {
+                return Err(Error::EncryptedEntry { entry: name });
+            }
+
+            // Skip directories and symlinks
+            if entry.is_dir() || entry.is_symlink() {
+                continue;
+            }
+
+            // Read the entire entry (triggers CRC validation in zip crate)
+            let mut buf = [0u8; 8192];
+            let mut entry_bytes = 0u64;
+            loop {
+                match entry.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => entry_bytes += n as u64,
+                    Err(e) => {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("CRC check failed for '{}': {}", name, e),
+                        )));
+                    }
+                }
+            }
+
+            entries_verified += 1;
+            bytes_verified += entry_bytes;
+        }
+
+        Ok(VerifyReport {
+            entries_verified,
+            bytes_verified,
+        })
+    }
+
+    /// Verify archive integrity from a file path.
+    pub fn verify_file<P: AsRef<Path>>(&self, path: P) -> Result<VerifyReport, Error> {
+        let file = fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        self.verify(reader)
+    }
+
+    /// Verify archive integrity from bytes.
+    pub fn verify_bytes(&self, data: &[u8]) -> Result<VerifyReport, Error> {
+        self.verify(std::io::Cursor::new(data))
     }
 
     /// Validate filename. Returns Ok(()) if valid, Err(reason) if invalid.

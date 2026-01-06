@@ -72,6 +72,8 @@ If your zip files only come from trusted sources you control, the standard `zip`
 
 ## Features
 
+- **CLI Tool** — `safe_unzip` command with `--list`, `--verify`, limits, and filtering
+- **Archive Verification** — Check CRC32 integrity without extracting
 - **Multi-Format Support** — ZIP (core), TAR, and 7z (feature flags)
 - **Partial Extraction** — Extract specific files with `only()` or glob patterns
 - **Progress Callbacks** — Monitor extraction progress (Rust API)
@@ -89,6 +91,11 @@ If your zip files only come from trusted sources you control, the standard `zip`
 - **Permission Stripping** — Removes setuid/setgid bits on Unix
 
 ## Installation
+
+**CLI:**
+```bash
+cargo install safe_unzip --features cli
+```
 
 **Rust:**
 ```toml
@@ -135,6 +142,31 @@ The Python bindings are **thin wrappers** over the Rust implementation via PyO3.
 - ✅ **No re-implementation** — Python calls Rust directly, no logic duplication
 
 Security reviewers: the Python API is a direct binding, not a port.
+
+## CLI Usage
+
+```bash
+# Extract archive to destination
+safe_unzip archive.zip -d /var/uploads
+
+# List contents without extracting
+safe_unzip archive.zip --list
+
+# Verify integrity (CRC32 check)
+safe_unzip archive.zip --verify
+
+# With limits
+safe_unzip archive.zip -d /var/uploads --max-size 100M --max-files 1000
+
+# Glob filtering
+safe_unzip archive.zip -d /var/uploads --include "**/*.py" --exclude "**/test_*"
+
+# Partial extraction
+safe_unzip archive.zip -d /var/uploads --only README.md --only LICENSE
+
+# Verbose output
+safe_unzip archive.zip -d /var/uploads -v
+```
 
 ## Quick Start
 
@@ -284,6 +316,35 @@ def update_bar(p):
     pbar.set_description(p['entry_name'])
 Extractor("/var/uploads").on_progress(update_bar).extract_file("archive.zip")
 pbar.close()
+```
+
+### Archive Verification
+
+Check archive integrity without extracting:
+
+```rust
+use safe_unzip::verify_file;
+
+// Verify CRC32 for all entries
+let report = verify_file("archive.zip")?;
+println!("Verified {} entries ({} bytes)", 
+    report.entries_verified, 
+    report.bytes_verified
+);
+```
+
+Or with the Extractor (useful if you want to verify then extract):
+
+```rust
+use safe_unzip::Extractor;
+
+let extractor = Extractor::new("/var/uploads")?;
+
+// First verify
+extractor.verify_file("archive.zip")?;
+
+// Then extract (re-reads archive, but guarantees integrity)
+extractor.extract_file("archive.zip")?;
 ```
 
 ### Overwrite Policies

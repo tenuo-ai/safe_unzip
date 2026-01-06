@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2026-01-05
+
+### Added
+
+- **CLI Tool**: Command-line interface for secure archive extraction
+  - `safe_unzip archive.zip -d /out` — extract to directory
+  - `safe_unzip archive.zip --list` — list contents
+  - `safe_unzip archive.zip --verify` — verify CRC32 integrity
+  - `--max-size`, `--max-files`, `--max-depth` — resource limits
+  - `--include "**/*.py"`, `--exclude "**/test_*"` — glob filtering
+  - `--only file1 --only file2` — partial extraction
+  - `--verbose`, `--quiet` — output control
+  - `--completions bash/zsh/fish` — shell completion scripts
+  - Enable with `cargo install safe_unzip --features cli`
+
+- **Python CLI**: Run as module
+  - `python -m safe_unzip archive.zip -d /out`
+  - Same options as Rust CLI
+
+- **Archive Verification**: Check integrity without extracting
+  - Rust: `Extractor::verify()`, `verify_file()`, `verify_bytes()`
+  - Python: `verify_file()`, `verify_bytes()`, async versions
+  - Reads all entries, validates CRC32, reports verification count
+
+- **Shell Completions**: Auto-complete for bash, zsh, fish
+  - `safe_unzip --completions bash > ~/.bash_completion.d/safe_unzip`
+
+- **CLI Integration Tests**: 15 tests covering all CLI features
+
 ## [0.1.5] - 2026-01-03
 
 ### Added

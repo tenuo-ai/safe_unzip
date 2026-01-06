@@ -1,6 +1,6 @@
 [package]
 name = "safe_unzip"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tenuo-ai/safe_unzip"
@@ -18,9 +18,17 @@ default = []
 tar = ["dep:tar", "dep:flate2"]  # Enable tar/tar.gz support
 async = ["tokio"]
 sevenz = ["dep:sevenz-rust", "dep:tempfile"]  # Enable 7z support
+cli = ["clap", "clap_complete", "tar"]  # CLI includes TAR support by default
+
+[[bin]]
+name = "safe_unzip"
+path = "src/bin/cli.rs"
+required-features = ["cli"]
 
 [dependencies]
 path_jail = "0.2"
+clap = { version = "4", features = ["derive"], optional = true }
+clap_complete = { version = "4", optional = true }
 # Use minimal zip features to avoid heavy compression dependencies
 zip = { version = "2.1", default-features = false, features = ["deflate", "time"] }
 tar = { version = "0.4", optional = true }

@@ -46,6 +46,7 @@ from safe_unzip._safe_unzip import (
     # Classes
     Extractor as _RustExtractor,
     Report,
+    VerifyReport,
     EntryInfo,
     # Functions - ZIP extraction
     extract_file,
@@ -60,6 +61,9 @@ from safe_unzip._safe_unzip import (
     list_tar_entries,
     list_tar_gz_entries,
     list_tar_bytes,
+    # Functions - Verification (no extraction)
+    verify_file,
+    verify_bytes,
     # Exceptions
     SafeUnzipError,
     PathEscapeError,
@@ -280,6 +284,24 @@ async def async_list_tar_bytes(data: bytes) -> list:
 
 
 # ============================================================================
+# Async Verification Functions
+# ============================================================================
+
+async def async_verify_file(path: _PathType) -> "VerifyReport":
+    """Verify archive integrity asynchronously without extracting.
+    
+    Reads and decompresses all file entries to check CRC32.
+    Returns VerifyReport on success, raises exception on CRC failure.
+    """
+    return await asyncio.to_thread(verify_file, path)
+
+
+async def async_verify_bytes(data: bytes) -> "VerifyReport":
+    """Verify archive integrity from bytes asynchronously."""
+    return await asyncio.to_thread(verify_bytes, data)
+
+
+# ============================================================================
 # AsyncExtractor - Async wrapper for Extractor
 # ============================================================================
 
@@ -403,6 +425,7 @@ __all__ = [
     "Extractor",
     "AsyncExtractor",
     "Report",
+    "VerifyReport",
     "EntryInfo",
     # Sync Functions - ZIP extraction
     "extract_file",
@@ -417,6 +440,9 @@ __all__ = [
     "list_tar_entries",
     "list_tar_gz_entries",
     "list_tar_bytes",
+    # Sync Functions - Verification (no extraction)
+    "verify_file",
+    "verify_bytes",
     # Async Functions - ZIP
     "async_extract_file",
     "async_extract_bytes",
@@ -427,6 +453,9 @@ __all__ = [
     # Async Functions - Listing
     "async_list_zip_entries",
     "async_list_tar_entries",
+    # Async Functions - Verification
+    "async_verify_file",
+    "async_verify_bytes",
     # Exceptions
     "SafeUnzipError",
     "PathEscapeError",
