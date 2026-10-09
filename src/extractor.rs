@@ -559,6 +559,13 @@ impl Extractor {
                         }
                     });
                 }
+                if written != entry.size() {
+                    return Err(Error::SizeMismatch {
+                        entry: name.clone(),
+                        declared: entry.size(),
+                        actual: written,
+                    });
+                }
 
                 total_bytes_written += written;
                 report.bytes_written += written;

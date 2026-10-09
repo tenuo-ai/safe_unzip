@@ -797,6 +797,13 @@ impl Driver {
                             }
                         });
                     }
+                    if copied.written != info.size {
+                        return Err(Error::SizeMismatch {
+                            entry: info.name.clone(),
+                            declared: info.size,
+                            actual: copied.written,
+                        });
+                    }
                     state.bytes_written += copied.written;
                 }
                 partial.commit();

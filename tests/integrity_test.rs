@@ -36,6 +36,30 @@ fn zip_with_bad_crc(files: &[(&str, &[u8])], corrupt: &str, method: CompressionM
     bytes
 }
 
+/// Build a valid deflated entry, then make both headers claim that it expands
+/// to more bytes than the compressed stream actually contains.
+fn zip_with_wrong_declared_size(content: &[u8], declared: u32) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options: FileOptions<()> =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("short.bin", options).unwrap();
+    zip.write_all(content).unwrap();
+    let mut bytes = zip.finish().unwrap().into_inner();
+
+    let local = bytes
+        .windows(4)
+        .position(|window| window == b"PK\x03\x04")
+        .unwrap();
+    bytes[local + 22..local + 26].copy_from_slice(&declared.to_le_bytes());
+
+    let central = bytes
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .unwrap();
+    bytes[central + 24..central + 28].copy_from_slice(&declared.to_le_bytes());
+    bytes
+}
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &b in data {
@@ -234,4 +258,49 @@ fn verify_reports_checksum_mismatch() {
         matches!(result, Err(Error::ChecksumMismatch { ref entry }) if entry == "bad.bin"),
         "{result:?}"
     );
+}
+
+#[test]
+fn rejects_entries_shorter_than_declared() {
+    let zip = zip_with_wrong_declared_size(b"hello", 100);
+
+    for mode in [ExtractionMode::Streaming, ExtractionMode::ValidateFirst] {
+        let dest = tempdir().unwrap();
+        let result = Extractor::new(dest.path())
+            .unwrap()
+            .mode(mode)
+            .extract(Cursor::new(zip.clone()));
+        assert!(
+            matches!(
+                result,
+                Err(Error::SizeMismatch {
+                    declared: 100,
+                    actual: 5,
+                    ..
+                })
+            ),
+            "Extractor {mode:?}: {result:?}"
+        );
+        assert!(!dest.path().join("short.bin").exists());
+    }
+
+    for validation in [ValidationMode::Streaming, ValidationMode::ValidateFirst] {
+        let dest = tempdir().unwrap();
+        let result = Driver::new(dest.path())
+            .unwrap()
+            .validation(validation)
+            .extract_zip(ZipAdapter::new(Cursor::new(zip.clone())).unwrap());
+        assert!(
+            matches!(
+                result,
+                Err(Error::SizeMismatch {
+                    declared: 100,
+                    actual: 5,
+                    ..
+                })
+            ),
+            "Driver {validation:?}: {result:?}"
+        );
+        assert!(!dest.path().join("short.bin").exists());
+    }
 }

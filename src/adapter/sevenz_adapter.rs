@@ -13,8 +13,8 @@ use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 
 /// Object-safe `Read + Seek`, so the adapter isn't generic over its source.
-trait Source: Read + Seek {}
-impl<T: Read + Seek> Source for T {}
+trait Source: Read + Seek + Send + Sync {}
+impl<T: Read + Seek + Send + Sync> Source for T {}
 
 /// Adapter for 7z archives.
 ///
@@ -51,7 +51,7 @@ impl SevenZAdapter {
     pub const DEFAULT_MAX_DECODER_MEMORY: u64 = 256 * 1024 * 1024;
 
     /// Create an adapter from any seekable reader.
-    pub fn new<R: Read + Seek + 'static>(reader: R) -> Result<Self, Error> {
+    pub fn new<R: Read + Seek + Send + Sync + 'static>(reader: R) -> Result<Self, Error> {
         let source: Box<dyn Source> = Box::new(reader);
         let mut reader = ArchiveReader::new(source, Password::empty()).map_err(|e| {
             Error::Io(std::io::Error::new(
@@ -143,8 +143,15 @@ impl SevenZAdapter {
         // sevenz-rust2's callback must return its own error type, so park ours
         // here and stop iteration.
         let mut failure: Option<Error> = None;
+        let mut stopped = false;
 
         let result = self.reader.for_each_entries(|entry, reader| {
+            // ArchiveReader only stops the current block when its callback
+            // returns false. Suppress callbacks from subsequent blocks so our
+            // documented stop/error semantics still apply to the whole archive.
+            if stopped || failure.is_some() {
+                return Ok(false);
+            }
             if entry.is_anti_item {
                 return Ok(true);
             }
@@ -167,7 +174,10 @@ impl SevenZAdapter {
                     }
                     Ok(true)
                 }
-                Ok(false) => Ok(false),
+                Ok(false) => {
+                    stopped = true;
+                    Ok(false)
+                }
                 Err(e) => {
                     failure = Some(e);
                     Ok(false)
@@ -258,5 +268,11 @@ mod tests {
         let mem = (192u32 << 20).to_le_bytes();
         let props = [6, mem[0], mem[1], mem[2], mem[3]];
         assert_eq!(decoder_memory(EncoderMethod::ID_PPMD, &props, 0), 192 << 20);
+    }
+
+    #[test]
+    fn adapter_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SevenZAdapter>();
     }
 }

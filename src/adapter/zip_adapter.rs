@@ -190,6 +190,21 @@ impl<R: Read + Seek> ZipAdapter<R> {
                     }
                 });
             }
+            if copied.written != info.size {
+                return Err(if cap < info.size {
+                    Error::FileTooLarge {
+                        entry: info.name.clone(),
+                        limit,
+                        size: info.size,
+                    }
+                } else {
+                    Error::SizeMismatch {
+                        entry: info.name.clone(),
+                        declared: info.size,
+                        actual: copied.written,
+                    }
+                });
+            }
             copied.written
         } else {
             0
@@ -279,6 +294,13 @@ pub(crate) fn drain_checked<R: Read>(
             entry: name.to_string(),
             declared,
             actual: copied.written + 1,
+        });
+    }
+    if copied.written != declared {
+        return Err(Error::SizeMismatch {
+            entry: name.to_string(),
+            declared,
+            actual: copied.written,
         });
     }
     Ok(copied.written)

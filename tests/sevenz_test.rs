@@ -177,3 +177,18 @@ fn rejects_7z_needing_too_much_decoder_memory() {
     );
     assert!(is_empty(dest.path()));
 }
+
+#[test]
+fn callback_false_stops_iteration_across_blocks() {
+    let mut adapter = SevenZAdapter::open(fixture("basic.7z")).unwrap();
+    let mut seen = 0;
+
+    adapter
+        .for_each(|_, _| {
+            seen += 1;
+            Ok(false)
+        })
+        .unwrap();
+
+    assert_eq!(seen, 1);
+}
