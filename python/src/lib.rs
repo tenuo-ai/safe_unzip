@@ -13,6 +13,7 @@ pyo3::create_exception!(safe_unzip, QuotaError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, AlreadyExistsError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, EncryptedArchiveError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, UnsupportedEntryTypeError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, ChecksumError, SafeUnzipError);
 
 fn to_py_err(err: safe_unzip::Error) -> PyErr {
     match err {
@@ -76,6 +77,16 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
                 entry, entry_type
             ))
         }
+        safe_unzip::Error::ChecksumMismatch { entry } => ChecksumError::new_err(format!(
+            "entry '{}' failed its CRC32 check (archive is corrupt)",
+            entry
+        )),
+        safe_unzip::Error::DecoderMemoryExceeded { required, limit } => {
+            QuotaError::new_err(format!(
+                "archive needs {} bytes of decoder memory (limit: {} bytes)",
+                required, limit
+            ))
+        }
         safe_unzip::Error::DestinationNotFound { path } => {
             PyIOError::new_err(format!("destination directory '{}' does not exist", path))
         }
@@ -93,7 +104,7 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
 // Report
 // ============================================================================
 
-#[pyclass(name = "Report")]
+#[pyclass(name = "Report", skip_from_py_object)]
 #[derive(Clone)]
 struct PyReport {
     #[pyo3(get)]
@@ -142,7 +153,7 @@ impl From<safe_unzip::ExtractionReport> for PyReport {
 // EntryInfo (for listing)
 // ============================================================================
 
-#[pyclass(name = "EntryInfo")]
+#[pyclass(name = "EntryInfo", skip_from_py_object)]
 #[derive(Clone)]
 struct PyEntryInfo {
     #[pyo3(get)]
@@ -215,7 +226,7 @@ struct PyExtractor {
     include_patterns: Option<Vec<String>>,
     exclude_patterns: Option<Vec<String>>,
     // Progress callback
-    progress_callback: Option<PyObject>,
+    progress_callback: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -346,7 +357,7 @@ impl PyExtractor {
     ///         print(f"[{p['entry_index']+1}/{p['total_entries']}] {p['entry_name']}")
     ///     
     ///     extractor.on_progress(on_progress).extract_file("archive.zip")
-    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: PyObject) -> PyRefMut<'_, Self> {
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
         slf.progress_callback = Some(callback);
         slf
     }
@@ -455,10 +466,10 @@ impl PyExtractor {
 
         // Apply progress callback
         if let Some(ref callback) = self.progress_callback {
-            // Clone with GIL to get a 'static PyObject
-            let callback: PyObject = Python::with_gil(|py| callback.clone_ref(py));
+            // Clone while attached to Python to get a 'static callback handle.
+            let callback: Py<PyAny> = Python::attach(|py| callback.clone_ref(py));
             extractor = extractor.on_progress(move |progress| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let dict = pyo3::types::PyDict::new(py);
                     let _ = dict.set_item("entry_name", &progress.entry_name);
                     let _ = dict.set_item("entry_size", progress.entry_size);
@@ -623,7 +634,7 @@ fn list_tar_bytes(data: &[u8]) -> PyResult<Vec<PyEntryInfo>> {
 // ============================================================================
 
 /// Report returned by verify functions.
-#[pyclass(name = "VerifyReport")]
+#[pyclass(name = "VerifyReport", skip_from_py_object)]
 #[derive(Clone)]
 struct PyVerifyReport {
     #[pyo3(get)]
@@ -725,6 +736,7 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "UnsupportedEntryTypeError",
         py.get_type::<UnsupportedEntryTypeError>(),
     )?;
+    m.add("ChecksumError", py.get_type::<ChecksumError>())?;
 
     Ok(())
 }

@@ -34,6 +34,12 @@ pub enum Error {
         actual: u64,
     },
 
+    /// Entry data does not match its stored CRC32 (corrupt or tampered archive).
+    ChecksumMismatch { entry: String },
+
+    /// Archive needs more decoder memory (e.g. 7z dictionary) than allowed.
+    DecoderMemoryExceeded { required: u64, limit: u64 },
+
     /// Path exceeds depth limit.
     PathTooDeep {
         entry: String,
@@ -141,6 +147,21 @@ impl fmt::Display for Error {
                     format_bytes(*declared)
                 )
             }
+            Self::ChecksumMismatch { entry } => {
+                write!(
+                    f,
+                    "entry '{}' failed its CRC32 check (archive is corrupt)",
+                    entry
+                )
+            }
+            Self::DecoderMemoryExceeded { required, limit } => {
+                write!(
+                    f,
+                    "archive needs {} of decoder memory (limit: {})",
+                    format_bytes(*required),
+                    format_bytes(*limit)
+                )
+            }
             Self::PathTooDeep {
                 entry,
                 depth,
@@ -191,6 +212,39 @@ impl std::error::Error for Error {
             _ => None,
         }
     }
+}
+
+impl Error {
+    /// Classify an I/O error raised while reading an entry's data.
+    ///
+    /// Archive readers report checksum failures as `io::Error`; surface those
+    /// as [`Error::ChecksumMismatch`] and keep everything else as [`Error::Io`].
+    pub(crate) fn from_entry_read(entry: &str, e: std::io::Error) -> Self {
+        if is_checksum_error(&e) {
+            Self::ChecksumMismatch {
+                entry: entry.to_string(),
+            }
+        } else {
+            Self::Io(e)
+        }
+    }
+}
+
+fn is_checksum_error(e: &std::io::Error) -> bool {
+    // zip: io::Error(InvalidData, "Invalid checksum")
+    if e.kind() == std::io::ErrorKind::InvalidData && e.to_string() == "Invalid checksum" {
+        return true;
+    }
+    // sevenz-rust2: io::Error::other(sevenz_rust2::Error::ChecksumVerificationFailed)
+    #[cfg(feature = "sevenz")]
+    if let Some(inner) = e.get_ref() {
+        if let Some(sevenz_rust2::Error::ChecksumVerificationFailed) =
+            inner.downcast_ref::<sevenz_rust2::Error>()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // Automatic conversions for ease of use

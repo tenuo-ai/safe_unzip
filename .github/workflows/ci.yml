@@ -35,6 +35,9 @@ jobs:
       - name: Run tests (with async feature)
         run: cargo test --verbose --features async
 
+      - name: Run tests (all features, incl. tar + 7z)
+        run: cargo test --verbose --all-features
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -51,6 +54,12 @@ jobs:
       
       - name: Run Clippy (with async feature)
         run: cargo clippy --all-targets --features async -- -D warnings
+
+      - name: Run Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Clippy (7z without tar)
+        run: cargo clippy --all-targets --features sevenz -- -D warnings
 
   fmt:
     name: Format

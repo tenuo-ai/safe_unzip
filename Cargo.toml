@@ -17,7 +17,7 @@ members = [".", "python"]
 default = []
 tar = ["dep:tar", "dep:flate2"]  # Enable tar/tar.gz support
 async = ["tokio"]
-sevenz = ["dep:sevenz-rust", "dep:tempfile"]  # Enable 7z support
+sevenz = ["dep:sevenz-rust2"]  # Enable 7z support
 cli = ["clap", "clap_complete", "tar"]  # CLI includes TAR support by default
 
 [[bin]]
@@ -26,7 +26,7 @@ path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [dependencies]
-path_jail = "0.2"
+path_jail = "0.5"
 clap = { version = "4", features = ["derive"], optional = true }
 clap_complete = { version = "4", optional = true }
 # Use minimal zip features to avoid heavy compression dependencies
@@ -34,8 +34,7 @@ zip = { version = "2.1", default-features = false, features = ["deflate", "time"
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }  # For .tar.gz support
 glob-match = "0.2"  # For include/exclude patterns
-sevenz-rust = { version = "0.6", optional = true }  # For 7z support
-tempfile = { version = "3", optional = true }  # For 7z from bytes
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "ppmd"], optional = true }  # For 7z support (read-only)
 tokio = { version = "1", features = ["rt", "fs", "sync"], optional = true }
 
 [dev-dependencies]

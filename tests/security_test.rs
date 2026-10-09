@@ -590,7 +590,7 @@ fn test_strict_size_enforcement() {
             assert_eq!(size, 6);
             println!("✅ Successfully caught zip bomb verification failure");
         }
-        Err(Error::Io(e)) if e.to_string().contains("Invalid checksum") => {
+        Err(Error::ChecksumMismatch { .. }) => {
             // The zip crate might catch the mismatch via CRC Checksum error
             // because our fake zip didn't update the CRC to match the fake size
             // (or the full content). This is also a valid rejection.

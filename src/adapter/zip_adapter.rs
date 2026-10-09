@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
 use std::path::Path;
 
+use crate::copy::copy_entry;
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 
@@ -170,12 +171,70 @@ impl<R: Read + Seek> ZipAdapter<R> {
         };
 
         let bytes_written = if matches!(kind, EntryKind::File) {
-            copy_limited(&mut entry, writer, limit)?
+            // Never write past the declared size: anything beyond it means the
+            // header lied (possible zip bomb).
+            let cap = limit.min(info.size);
+            let copied = copy_entry(&mut entry, writer, cap, &info.name)?;
+            if copied.overflow {
+                return Err(if cap < info.size {
+                    Error::FileTooLarge {
+                        entry: info.name.clone(),
+                        limit,
+                        size: info.size,
+                    }
+                } else {
+                    Error::SizeMismatch {
+                        entry: info.name.clone(),
+                        declared: info.size,
+                        actual: copied.written + 1,
+                    }
+                });
+            }
+            if copied.written != info.size {
+                return Err(if cap < info.size {
+                    Error::FileTooLarge {
+                        entry: info.name.clone(),
+                        limit,
+                        size: info.size,
+                    }
+                } else {
+                    Error::SizeMismatch {
+                        entry: info.name.clone(),
+                        declared: info.size,
+                        actual: copied.written,
+                    }
+                });
+            }
+            copied.written
         } else {
             0
         };
 
         Ok((info, bytes_written))
+    }
+
+    /// Decompress a file entry without writing it, checking its CRC32.
+    ///
+    /// Returns the number of bytes decompressed. Directories and symlinks
+    /// are skipped and return 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry is encrypted, fails its CRC32 check, or
+    /// decompresses to more than its declared size.
+    pub fn verify_entry(&mut self, index: usize) -> Result<u64, Error> {
+        let mut entry = self.archive.by_index(index)?;
+        let name = entry.name().to_string();
+
+        if entry.encrypted() {
+            return Err(Error::EncryptedEntry { entry: name });
+        }
+        if entry.is_dir() || entry.is_symlink() {
+            return Ok(0);
+        }
+
+        let declared = entry.size();
+        drain_checked(&mut entry, &name, declared)
     }
 
     /// Get entry info by index without reading content.
@@ -220,30 +279,29 @@ impl ZipAdapter<BufReader<File>> {
     }
 }
 
-/// Copy with a byte limit, returning bytes written.
-fn copy_limited<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    limit: u64,
+/// Read an entry to EOF without storing it, so the zip crate checks its CRC32.
+///
+/// Reads at most `declared + 1` bytes: one byte past the declared size is
+/// enough to detect a lying header without decompressing a bomb.
+pub(crate) fn drain_checked<R: Read>(
+    entry: &mut R,
+    name: &str,
+    declared: u64,
 ) -> Result<u64, Error> {
-    let mut total = 0u64;
-    let mut buf = [0u8; 8192];
-
-    loop {
-        let remaining = limit.saturating_sub(total);
-        if remaining == 0 {
-            break;
-        }
-
-        let to_read = buf.len().min(remaining as usize);
-        let n = reader.read(&mut buf[..to_read])?;
-        if n == 0 {
-            break;
-        }
-
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
+    let copied = copy_entry(entry, &mut std::io::sink(), declared, name)?;
+    if copied.overflow {
+        return Err(Error::SizeMismatch {
+            entry: name.to_string(),
+            declared,
+            actual: copied.written + 1,
+        });
     }
-
-    Ok(total)
+    if copied.written != declared {
+        return Err(Error::SizeMismatch {
+            entry: name.to_string(),
+            declared,
+            actual: copied.written,
+        });
+    }
+    Ok(copied.written)
 }

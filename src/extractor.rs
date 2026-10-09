@@ -1,6 +1,10 @@
 use crate::error::Error;
 use crate::limits::Limits;
 use path_jail::Jail;
+
+use crate::adapter::drain_checked;
+use crate::copy::copy_entry;
+use crate::partial::PartialFile;
 use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Component, Path};
@@ -48,14 +52,17 @@ pub enum SymlinkPolicy {
 ///
 /// | Mode | Speed | On Failure | Use When |
 /// |------|-------|------------|----------|
-/// | `Streaming` | Fast (1 pass) | Partial files remain on disk | Speed matters; you'll clean up on error |
+/// | `Streaming` | Fast (1 pass) | Earlier files remain on disk | Speed matters; you'll clean up on error |
 /// | `ValidateFirst` | Slower (2 passes) | No files written if validation fails | Can't tolerate partial state |
 ///
 /// ## Important Limitations
 ///
 /// **Neither mode is truly atomic.** If extraction fails mid-write (e.g., disk full),
-/// partial files will remain regardless of mode. `ValidateFirst` only prevents writes
-/// when *validation* fails (bad paths, exceeded limits, etc.), not when I/O fails.
+/// earlier files will remain regardless of mode. `ValidateFirst` only prevents writes
+/// when *validation* fails (bad paths, exceeded limits, CRC32 mismatch), not when I/O fails.
+///
+/// In both modes, the file being written when an error occurs (bad CRC32, size
+/// mismatch, I/O error) is removed, so no truncated or unverified file is left behind.
 ///
 /// For true atomicity, extract to a temp directory and move on success (planned for v0.2).
 #[derive(Debug, Clone, Copy, Default)]
@@ -67,10 +74,10 @@ pub enum ExtractionMode {
     #[default]
     Streaming,
 
-    /// Validate all entries first (paths, limits, policies), then extract.
+    /// Validate all entries first (paths, limits, policies, CRC32), then extract.
     ///
-    /// **Tradeoff:** 2x slower (iterates archive twice), but guarantees no files are
-    /// written if validation fails. Still not atomic for I/O failures during extraction.
+    /// **Tradeoff:** 2x slower (decompresses the archive twice), but guarantees no files
+    /// are written if validation fails. Still not atomic for I/O failures during extraction.
     ///
     /// Note: Filter callbacks are NOT applied during validation. Limits are checked
     /// against all entries, which is conservative—validation may reject archives that
@@ -512,7 +519,7 @@ impl Extractor {
                     }
                 };
 
-                // SECURITY: LimitReader
+                // SECURITY: bounded copy
                 // Enforce:
                 // 1. entry.size() (Declared size) - catch bombs that lie
                 // 2. limits.max_single_file - catch bombs exceeding limit
@@ -525,59 +532,39 @@ impl Extractor {
                     .saturating_sub(total_bytes_written);
                 let hard_limit = limit_single.min(remaining_global);
 
-                let mut limiter = LimitReader::new(&mut entry, hard_limit);
+                let partial = PartialFile::new(&safe_path);
                 let mut outfile = outfile;
+                let copied = copy_entry(&mut entry, &mut outfile, hard_limit, &name)?;
+                let written = copied.written;
 
-                // We use io::copy, which loops until EOF or error.
-                // LimitReader returns EOF at limit.
-                // BUT we need to distinguish EOF at limit vs natural EOF.
-                // If EOF at limit AND entry has more data -> Error.
-
-                let written = std::io::copy(&mut limiter, &mut outfile)?;
-
-                // Check if we hit the limit strictly
-                if limiter.hit_limit {
-                    // If we hit the limit, we must check if there was MORE data expected.
-                    // If declared size > written, we stopped early -> OK?
-                    // No, if we stopped because of max_single_file, it's an error if the file was larger.
-                    // If we stopped because of max_total_bytes, it's an error.
-                    // If we stopped because of entry.size(), it's fine (just consumed declared).
-
-                    // Actually, if we hit the hard_limit, we should check WHY.
-                    if written >= self.limits.max_single_file
-                        && entry.size() > self.limits.max_single_file
-                    {
-                        return Err(Error::FileTooLarge {
-                            entry: name,
-                            limit: self.limits.max_single_file,
-                            size: written + 1, // At least this much
-                        });
-                    }
-
-                    if remaining_global <= written && written < entry.size() {
-                        return Err(Error::TotalSizeExceeded {
-                            limit: self.limits.max_total_bytes,
-                            would_be: total_bytes_written + written + 1,
-                        });
-                    }
-
-                    // Specific check: if written == entry.size(), we are good.
-                    // If written < entry.size() but we hit limit, it means limit < entry.size().
-                    // Which implies one of the above errors triggered.
-                }
-
-                // SECURITY: Detect zip bombs that lie about declared size.
-                // If we wrote exactly the declared size, check if there's more data.
-                // If so, the file is larger than declared (potential zip bomb).
-                if written == entry.size() {
-                    let mut buf = [0u8; 1];
-                    if entry.read(&mut buf)? > 0 {
-                        return Err(Error::SizeMismatch {
+                // More data than the cap allows: report which bound it broke.
+                if copied.overflow {
+                    return Err(if hard_limit == entry.size() {
+                        // Decompressed past its declared size (zip bomb that lies).
+                        Error::SizeMismatch {
                             entry: name.clone(),
                             declared: entry.size(),
-                            actual: entry.size() + 1, // At least this much more
-                        });
-                    }
+                            actual: written + 1,
+                        }
+                    } else if hard_limit == self.limits.max_single_file {
+                        Error::FileTooLarge {
+                            entry: name,
+                            limit: self.limits.max_single_file,
+                            size: written + 1,
+                        }
+                    } else {
+                        Error::TotalSizeExceeded {
+                            limit: self.limits.max_total_bytes,
+                            would_be: total_bytes_written + written + 1,
+                        }
+                    });
+                }
+                if written != entry.size() {
+                    return Err(Error::SizeMismatch {
+                        entry: name.clone(),
+                        declared: entry.size(),
+                        actual: written,
+                    });
                 }
 
                 total_bytes_written += written;
@@ -595,15 +582,18 @@ impl Extractor {
                         fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
                     }
                 }
+                partial.commit();
             }
         }
 
         Ok(report)
     }
 
-    /// Validate all entries without extracting (fast dry run).
+    /// Validate all entries without writing anything.
     ///
-    /// Uses `by_index_raw()` to read metadata without decompressing.
+    /// First checks metadata via `by_index_raw()` (no decompression), then
+    /// decompresses each file to verify its CRC32. The metadata checks bound
+    /// the declared sizes, so the integrity pass cannot be used as a bomb.
     ///
     /// **Note:** Filter callbacks are NOT applied during validation. This means:
     /// - File count/size limits are checked against ALL entries
@@ -686,6 +676,19 @@ impl Extractor {
             });
         }
 
+        // 6. Integrity: decompress every file and check its CRC32. The checks
+        // above bound the declared sizes, and drain_checked never reads more
+        // than one byte past them.
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            if entry.is_dir() || entry.is_symlink() {
+                continue;
+            }
+            let name = entry.name().to_string();
+            let declared = entry.size();
+            drain_checked(&mut entry, &name, declared)?;
+        }
+
         Ok(())
     }
 
@@ -742,21 +745,9 @@ impl Extractor {
                 continue;
             }
 
-            // Read the entire entry (triggers CRC validation in zip crate)
-            let mut buf = [0u8; 8192];
-            let mut entry_bytes = 0u64;
-            loop {
-                match entry.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => entry_bytes += n as u64,
-                    Err(e) => {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("CRC check failed for '{}': {}", name, e),
-                        )));
-                    }
-                }
-            }
+            // Read the entry to EOF (triggers CRC validation in zip crate)
+            let declared = entry.size();
+            let entry_bytes = drain_checked(&mut entry, &name, declared)?;
 
             entries_verified += 1;
             bytes_verified += entry_bytes;
@@ -827,46 +818,5 @@ impl Extractor {
             }
         }
         Ok(())
-    }
-}
-
-// Helper struct to enforce read limits
-struct LimitReader<'a, R> {
-    inner: &'a mut R,
-    limit: u64,
-    bytes_read: u64,
-    hit_limit: bool,
-}
-
-impl<'a, R: Read> LimitReader<'a, R> {
-    fn new(inner: &'a mut R, limit: u64) -> Self {
-        Self {
-            inner,
-            limit,
-            bytes_read: 0,
-            hit_limit: false,
-        }
-    }
-}
-
-impl<'a, R: Read> Read for LimitReader<'a, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.bytes_read >= self.limit {
-            self.hit_limit = true;
-            return Ok(0);
-        }
-
-        // Cap the read length to the limit
-        let remaining = self.limit - self.bytes_read;
-        let len = buf.len().min(remaining as usize);
-
-        let n = self.inner.read(&mut buf[0..len])?;
-        self.bytes_read += n as u64;
-
-        if self.bytes_read >= self.limit {
-            self.hit_limit = true;
-        }
-
-        Ok(n)
     }
 }

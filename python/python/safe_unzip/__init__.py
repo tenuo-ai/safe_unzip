@@ -72,6 +72,7 @@ from safe_unzip._safe_unzip import (
     AlreadyExistsError,
     EncryptedArchiveError,
     UnsupportedEntryTypeError,
+    ChecksumError,
 )
 
 _PathType = Union[str, PathLike, Path]
@@ -464,6 +465,7 @@ __all__ = [
     "AlreadyExistsError",
     "EncryptedArchiveError",
     "UnsupportedEntryTypeError",
+    "ChecksumError",
 ]
 
 __version__ = "0.1.4"

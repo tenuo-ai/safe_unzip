@@ -437,3 +437,7 @@ class UnsupportedEntryTypeError(SafeUnzipError):
     """Archive contains unsupported entry type (device file, fifo, etc.)."""
     ...
 
+class ChecksumError(SafeUnzipError):
+    """Entry data does not match its stored CRC32 (corrupt or tampered archive)."""
+    ...
+

@@ -10,9 +10,12 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "tar")]
 use crate::adapter::TarAdapter;
 use crate::adapter::ZipAdapter;
+#[cfg(feature = "sevenz")]
+use crate::copy::copy_entry;
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 use crate::limits::Limits;
+use crate::partial::PartialFile;
 use crate::policy::{
     CountPolicy, DepthPolicy, ExtractionState, PathPolicy, PolicyChain, SizePolicy,
     SymlinkBehavior, SymlinkPolicy,
@@ -37,6 +40,8 @@ pub enum ValidationMode {
     #[default]
     Streaming,
     /// Validate all entries first, then extract. Slower but atomic for validation failures.
+    ///
+    /// For ZIP, validation also decompresses every file to check its CRC32.
     ValidateFirst,
 }
 
@@ -273,6 +278,13 @@ impl Driver {
             }
         }
 
+        // Metadata passed and the declared sizes fit the limits, so the
+        // integrity pass is bounded. Decompress each file to check its CRC32
+        // before anything is written.
+        for index in 0..adapter.len() {
+            adapter.verify_entry(index)?;
+        }
+
         Ok(())
     }
 
@@ -362,6 +374,7 @@ impl Driver {
                     }
                 };
 
+                let partial = PartialFile::new(&safe_path);
                 let mut outfile = outfile;
                 let limit = self.limits.max_single_file.min(
                     self.limits
@@ -378,6 +391,7 @@ impl Driver {
                     let safe_mode = mode & 0o0777;
                     fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
                 }
+                partial.commit();
 
                 state.bytes_written += written;
                 state.files_extracted += 1;
@@ -498,6 +512,7 @@ impl Driver {
                 let Some(mut outfile) = outfile else {
                     return Ok(()); // Skipped
                 };
+                let partial = PartialFile::new(&safe_path);
 
                 if let Some(reader) = reader {
                     let limit = self.limits.max_single_file.min(
@@ -515,6 +530,7 @@ impl Driver {
                     let safe_mode = mode & 0o0777;
                     fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
                 }
+                partial.commit();
 
                 state.files_extracted += 1;
             }
@@ -568,6 +584,7 @@ impl Driver {
                 let Some(mut outfile) = outfile else {
                     return Ok(()); // Skipped
                 };
+                let partial = PartialFile::new(&safe_path);
 
                 if let Some(data) = data {
                     use std::io::Write;
@@ -581,6 +598,7 @@ impl Driver {
                     let safe_mode = mode & 0o0777;
                     fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
                 }
+                partial.commit();
 
                 state.files_extracted += 1;
             }
@@ -594,7 +612,7 @@ impl Driver {
 
     /// Open a file for writing based on overwrite policy.
     /// Returns None if the file should be skipped.
-    #[cfg(feature = "tar")]
+    #[cfg(any(feature = "tar", feature = "sevenz"))]
     fn open_for_write(
         &self,
         path: &Path,
@@ -659,6 +677,10 @@ impl Driver {
     ///
     /// Requires the `sevenz` feature to be enabled.
     ///
+    /// Entries are decompressed one at a time and streamed to disk under the
+    /// same limits as ZIP. In `ValidateFirst` mode, every entry's metadata is
+    /// checked and its CRC32 verified before anything is written.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -670,13 +692,17 @@ impl Driver {
     #[cfg(feature = "sevenz")]
     pub fn extract_7z(
         &self,
-        adapter: crate::adapter::SevenZAdapter,
+        mut adapter: crate::adapter::SevenZAdapter,
     ) -> Result<ExtractionReport, Error> {
         let policies = self.build_policies()?;
-        let mut state = ExtractionState::default();
 
-        adapter.for_each(|info, data| {
-            self.extract_7z_entry(info, data, &policies, &mut state)?;
+        if self.validation == ValidationMode::ValidateFirst {
+            self.validate_all_7z(&mut adapter, &policies)?;
+        }
+
+        let mut state = ExtractionState::default();
+        adapter.for_each(|info, reader| {
+            self.extract_7z_entry(info, reader, &policies, &mut state)?;
             Ok(true)
         })?;
 
@@ -688,12 +714,34 @@ impl Driver {
         })
     }
 
+    /// Validate all 7z entries (metadata, then CRC32) without writing.
+    #[cfg(feature = "sevenz")]
+    fn validate_all_7z(
+        &self,
+        adapter: &mut crate::adapter::SevenZAdapter,
+        policies: &PolicyChain,
+    ) -> Result<(), Error> {
+        let mut state = ExtractionState::default();
+        for info in adapter.entries_metadata() {
+            policies.check_all(&info, &state)?;
+            if matches!(info.kind, EntryKind::File) {
+                state.bytes_written += info.size;
+                state.files_extracted += 1;
+            }
+        }
+
+        // Declared sizes now fit the limits, and each entry's reader stops at
+        // its declared size, so this pass is bounded. The adapter drains
+        // every file (checking CRC32) when the callback leaves it unread.
+        adapter.for_each(|_, _| Ok(true))
+    }
+
     /// Extract a single 7z entry.
     #[cfg(feature = "sevenz")]
     fn extract_7z_entry(
         &self,
         info: &EntryInfo,
-        data: Option<&[u8]>,
+        reader: Option<&mut dyn Read>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
     ) -> Result<(), Error> {
@@ -724,12 +772,41 @@ impl Driver {
                 let Some(mut outfile) = outfile else {
                     return Ok(()); // Skipped
                 };
+                let partial = PartialFile::new(&safe_path);
 
-                if let Some(bytes) = data {
-                    use std::io::Write;
-                    outfile.write_all(bytes)?;
-                    state.bytes_written += bytes.len() as u64;
+                if let Some(reader) = reader {
+                    let limit = self.limits.max_single_file.min(
+                        self.limits
+                            .max_total_bytes
+                            .saturating_sub(state.bytes_written),
+                    );
+                    let cap = limit.min(info.size);
+                    let copied = copy_entry(reader, &mut outfile, cap, &info.name)?;
+                    if copied.overflow {
+                        return Err(if cap < info.size {
+                            Error::FileTooLarge {
+                                entry: info.name.clone(),
+                                limit,
+                                size: info.size,
+                            }
+                        } else {
+                            Error::SizeMismatch {
+                                entry: info.name.clone(),
+                                declared: info.size,
+                                actual: copied.written + 1,
+                            }
+                        });
+                    }
+                    if copied.written != info.size {
+                        return Err(Error::SizeMismatch {
+                            entry: info.name.clone(),
+                            declared: info.size,
+                            actual: copied.written,
+                        });
+                    }
+                    state.bytes_written += copied.written;
                 }
+                partial.commit();
 
                 state.files_extracted += 1;
             }
