@@ -1,6 +1,8 @@
+mod copy;
 mod error;
 mod extractor;
 mod limits;
+mod partial;
 
 // New architecture modules (v0.2)
 pub mod adapter;

@@ -12,6 +12,7 @@ mod sevenz_adapter;
 
 #[cfg(feature = "tar")]
 pub use tar_adapter::{copy_limited, TarAdapter};
+pub(crate) use zip_adapter::drain_checked;
 pub use zip_adapter::ZipAdapter;
 
 #[cfg(feature = "sevenz")]

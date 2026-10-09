@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Corrupt entries no longer leave files on disk** ([#3](https://github.com/tenuo-ai/safe_unzip/issues/3)).
+  A file whose write fails (CRC32 mismatch, size mismatch, limit exceeded, I/O
+  error) is now removed instead of left truncated or unverified. Applies to
+  `Extractor`, `AsyncExtractor`, and `Driver` (ZIP, TAR, 7z).
+- **`ValidateFirst` now checks CRC32** for ZIP archives in both `Extractor` and
+  `Driver`, so a corrupt archive writes nothing (previously validation only read
+  metadata). Validation decompresses each file once, bounded by its declared size.
+- **`Driver` ZIP extraction could skip the CRC32 check** when an entry's size
+  equalled the remaining limit, and silently truncated entries that
+  decompressed past their declared size. It now forces the check and returns
+  `SizeMismatch` / `FileTooLarge`.
+- `Extractor::verify()` reads at most one byte past each entry's declared size.
+- **7z extraction no longer buffers the whole archive in memory.** `SevenZAdapter`
+  decompressed every entry into RAM before any limit was checked, so a small 7z
+  bomb could exhaust memory. Entries now stream to disk one at a time under the
+  usual limits (peak RSS measured flat at ~38 MB for both 64 MiB and 512 MiB
+  of output; previously 175 MB for 64 MiB). The decoder runs single-threaded,
+  since the multi-threaded LZMA2 decoder buffers ahead.
+- **7z decoder memory is capped** (default 256 MiB, configurable with
+  `SevenZAdapter::max_decoder_memory()`). The LZMA2 decoder allocates the
+  header-declared dictionary (up to 4 GiB) before producing output, so a tiny
+  archive could force a huge allocation.
+- **7z `ValidateFirst` was ignored**; it now checks all metadata and CRC32s
+  before writing.
+- The `sevenz` feature did not compile without `tar`.
+
+### Changed
+
+- **7z backend switched to `sevenz-rust2`** ([#2](https://github.com/tenuo-ai/safe_unzip/issues/2)).
+  `sevenz-rust` is unmaintained and its repository is gone. `sevenz-rust2`
+  is built read-only (no encoder, no AES). It requires Rust 1.93+ when the
+  `sevenz` feature is enabled. `SevenZAdapter::from_bytes` no longer writes a
+  temp file, and the optional `tempfile` dependency is removed.
+- **`path_jail` upgraded to 0.5** (from 0.2).
+- **New error variants** (`Error` is `#[non_exhaustive]`):
+  `ChecksumMismatch { entry }` for CRC32 failures (previously `Io` with
+  "Invalid checksum"), and `DecoderMemoryExceeded { required, limit }`.
+  Python raises `ChecksumError` (a `SafeUnzipError`; previously `IOError`) and
+  `QuotaError` respectively.
+- **`SevenZAdapter::for_each` now passes a reader** (`Option<&mut dyn Read>`)
+  instead of a byte slice, and takes `&mut self`. `entries_metadata()` reads
+  the header only. Added `SevenZAdapter::new()` for any `Read + Seek` source.
+
 ## [0.1.6] - 2026-01-05
 
 ### Added

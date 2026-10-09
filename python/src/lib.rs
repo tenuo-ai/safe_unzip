@@ -13,6 +13,7 @@ pyo3::create_exception!(safe_unzip, QuotaError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, AlreadyExistsError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, EncryptedArchiveError, SafeUnzipError);
 pyo3::create_exception!(safe_unzip, UnsupportedEntryTypeError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, ChecksumError, SafeUnzipError);
 
 fn to_py_err(err: safe_unzip::Error) -> PyErr {
     match err {
@@ -74,6 +75,16 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
             UnsupportedEntryTypeError::new_err(format!(
                 "entry '{}' has unsupported type '{}' (device files, fifos not allowed)",
                 entry, entry_type
+            ))
+        }
+        safe_unzip::Error::ChecksumMismatch { entry } => ChecksumError::new_err(format!(
+            "entry '{}' failed its CRC32 check (archive is corrupt)",
+            entry
+        )),
+        safe_unzip::Error::DecoderMemoryExceeded { required, limit } => {
+            QuotaError::new_err(format!(
+                "archive needs {} bytes of decoder memory (limit: {} bytes)",
+                required, limit
             ))
         }
         safe_unzip::Error::DestinationNotFound { path } => {
@@ -725,6 +736,7 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "UnsupportedEntryTypeError",
         py.get_type::<UnsupportedEntryTypeError>(),
     )?;
+    m.add("ChecksumError", py.get_type::<ChecksumError>())?;
 
     Ok(())
 }

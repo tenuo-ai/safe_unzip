@@ -101,7 +101,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = SymlinkMode::Skip)]
     symlinks: SymlinkMode,
 
-    /// Validate all entries before extracting
+    /// Validate all entries (paths, limits, CRC32) before writing anything
     #[arg(long)]
     validate_first: bool,
 

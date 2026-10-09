@@ -388,10 +388,10 @@ let report = Extractor::new("/var/uploads")?
 
 | Mode | Speed | On Failure | Use When |
 |------|-------|------------|----------|
-| `Streaming` (default) | Fast (1 pass) | Partial files remain | Speed matters; you'll clean up on error |
-| `ValidateFirst` | Slower (2 passes) | No files if validation fails | Can't tolerate partial state |
+| `Streaming` (default) | Fast (1 pass) | Earlier files remain; the failing file is removed | Speed matters; you'll clean up on error |
+| `ValidateFirst` | Slower (2 passes) | No files if validation or CRC32 check fails | Can't tolerate partial state |
 
-**⚠️ Neither mode is truly atomic.** If extraction fails mid-write (e.g., disk full), partial files remain regardless of mode. `ValidateFirst` only prevents writes when *validation* fails (bad paths, limits exceeded), not when I/O fails during extraction.
+**⚠️ Neither mode is truly atomic.** If extraction fails mid-write (e.g., disk full), files extracted before the failure remain regardless of mode. `ValidateFirst` prevents writes when *validation* fails (bad paths, limits exceeded, CRC32 mismatch), not when I/O fails during extraction. In both modes, a file whose write fails (bad checksum, size mismatch, I/O error) is deleted rather than left truncated or unverified.
 
 ```rust
 use safe_unzip::{Extractor, ExtractionMode};
@@ -462,7 +462,7 @@ let report = Driver::new("/var/uploads")?
     .extract_7z_bytes(&seven_z_bytes)?;
 ```
 
-**Note:** 7z archives are fully decompressed into memory before extraction, so large archives may use significant RAM.
+**Note:** 7z entries are decompressed one at a time and streamed to disk under the same limits as ZIP, so memory use does not grow with archive size. The decoder's dictionary is allocated up front from the archive header, so archives needing more than 256 MiB of decoder memory are rejected (`Error::DecoderMemoryExceeded`); raise the cap with `SevenZAdapter::max_decoder_memory()`. In solid archives, skipped entries are still decompressed (not written) to reach later ones.
 
 **Python:**
 ```python
@@ -639,7 +639,7 @@ This is intentional—encryption handling is outside our security scope. Passwor
 
 ### Extraction Behavior
 
-- **Partial state in Streaming mode** — If extraction fails mid-way, already-extracted files remain on disk. Use `ExtractionMode::ValidateFirst` to validate before writing.
+- **Partial state in Streaming mode** — If extraction fails mid-way, files extracted before the failing entry remain on disk (the failing file itself is removed). Use `ExtractionMode::ValidateFirst` to validate, including CRC32, before writing.
 - **Filters not applied during validation** — In `ValidateFirst` mode, limits are checked against ALL entries. Filtered entries still count toward limits. This is conservative: validation may reject archives that would succeed with filtering.
 
 ### Security Scope
