@@ -4,6 +4,7 @@ use path_jail::Jail;
 
 use crate::adapter::drain_checked;
 use crate::copy::copy_entry;
+use crate::flatten::{base_name, FlatNames};
 use crate::partial::PartialFile;
 use std::fs;
 use std::io::{Read, Seek};
@@ -134,6 +135,7 @@ pub struct Extractor {
     overwrite: OverwritePolicy,
     symlinks: SymlinkPolicy,
     mode: ExtractionMode,
+    junk_paths: bool,
     // Using a boxed closure for the filter
     #[allow(clippy::type_complexity)]
     filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
@@ -201,6 +203,7 @@ impl Extractor {
             overwrite: OverwritePolicy::default(),
             symlinks: SymlinkPolicy::default(),
             mode: ExtractionMode::default(),
+            junk_paths: false,
             filter: None,
             on_progress: None,
         })
@@ -223,6 +226,31 @@ impl Extractor {
 
     pub fn mode(mut self, mode: ExtractionMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Write every file at the destination root under its base name, without
+    /// creating directories (like `unzip -j`).
+    ///
+    /// All checks (filename rules, path jail, depth, filters) still run on each
+    /// entry's full archive path. Directory entries are skipped. When two
+    /// entries share a base name, the overwrite policy decides: `Error` (the
+    /// default) fails with [`Error::PathCollision`] naming both entries, `Skip`
+    /// keeps the first, and `Overwrite` keeps the last.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use safe_unzip::Extractor;
+    ///
+    /// // docs/guide/intro.md -> /tmp/out/intro.md
+    /// let report = Extractor::new("/tmp/out")?
+    ///     .junk_paths(true)
+    ///     .extract_file("archive.zip")?;
+    /// # Ok::<(), safe_unzip::Error>(())
+    /// ```
+    pub fn junk_paths(mut self, junk: bool) -> Self {
+        self.junk_paths = junk;
         self
     }
 
@@ -353,6 +381,7 @@ impl Extractor {
         let mut report = Report::default();
         let mut total_bytes_written: u64 = 0;
         let total_entries = archive.len();
+        let mut flat = FlatNames::default();
 
         for i in 0..total_entries {
             let mut entry = archive.by_index(i)?;
@@ -463,6 +492,19 @@ impl Extractor {
                     would_be: total_bytes_written + entry.size(),
                 });
             }
+
+            // 6. Junk paths: drop directories, write files under their base name.
+            let safe_path = if !self.junk_paths {
+                safe_path
+            } else if entry.is_dir() {
+                continue;
+            } else {
+                let base = base_name(&name)?;
+                if matches!(self.overwrite, OverwritePolicy::Error) {
+                    flat.claim(&base, &name)?;
+                }
+                self.root.join(base)
+            };
 
             // 7. EXECUTION
             if entry.is_dir() {
@@ -605,6 +647,8 @@ impl Extractor {
         let mut total_size: u64 = 0;
         let mut file_count: usize = 0;
 
+        let mut flat = FlatNames::default();
+
         for i in 0..archive.len() {
             // by_index_raw reads metadata WITHOUT decompressing
             let entry = archive.by_index_raw(i)?;
@@ -652,6 +696,24 @@ impl Extractor {
                     limit: self.limits.max_single_file,
                     size: entry.size(),
                 });
+            }
+
+            // 5. Junk-paths collisions, among entries the filter keeps
+            if self.junk_paths
+                && matches!(self.overwrite, OverwritePolicy::Error)
+                && !entry.is_dir()
+                && !entry.is_symlink()
+            {
+                let info = EntryInfo {
+                    name: &name,
+                    size: entry.size(),
+                    compressed_size: entry.compressed_size(),
+                    is_dir: false,
+                    is_symlink: false,
+                };
+                if self.filter.as_ref().is_none_or(|keep| keep(&info)) {
+                    flat.claim(&base_name(&name)?, &name)?;
+                }
             }
 
             // Accumulate totals (skip symlinks and dirs)

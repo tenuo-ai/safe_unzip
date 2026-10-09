@@ -50,6 +50,13 @@ pub enum Error {
     /// File already exists and policy is Error.
     AlreadyExists { entry: String },
 
+    /// Two entries extract to the same file (junk-paths mode, policy Error).
+    PathCollision {
+        entry: String,
+        previous: String,
+        path: String,
+    },
+
     /// Destination directory does not exist or is invalid.
     DestinationNotFound { path: String },
 
@@ -175,6 +182,17 @@ impl fmt::Display for Error {
             }
             Self::AlreadyExists { entry } => {
                 write!(f, "file '{}' already exists", entry)
+            }
+            Self::PathCollision {
+                entry,
+                previous,
+                path,
+            } => {
+                write!(
+                    f,
+                    "entries '{}' and '{}' both extract to '{}' (junk paths)",
+                    previous, entry, path
+                )
             }
             Self::DestinationNotFound { path } => {
                 write!(f, "destination directory '{}' does not exist", path)

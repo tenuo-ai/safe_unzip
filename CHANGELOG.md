@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Junk paths** ([#4](https://github.com/tenuo-ai/safe_unzip/issues/4)): extract
+  every file into the destination under its base name without creating
+  directories, like `unzip -j`.
+  - Rust: `Extractor::junk_paths(true)`, `AsyncExtractor::junk_paths(true)`,
+    `Driver::junk_paths(true)` (ZIP, TAR, 7z)
+  - CLI: `-j` / `--junk-paths` (Rust and `python -m safe_unzip`)
+  - Python: `Extractor(...).junk_paths()`
+  - All checks and filters still use the full archive path. Base-name
+    collisions follow the overwrite policy; with `Error` (the default) the new
+    `Error::PathCollision { entry, previous, path }` names both entries
+    (Python: `AlreadyExistsError`), and `ValidateFirst` reports it before
+    writing.
+
 ### Fixed
 
 - **Corrupt entries no longer leave files on disk** ([#3](https://github.com/tenuo-ai/safe_unzip/issues/3)).

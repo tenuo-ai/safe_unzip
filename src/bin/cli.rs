@@ -105,6 +105,11 @@ struct Cli {
     #[arg(long)]
     validate_first: bool,
 
+    /// Junk paths: extract every file into the destination without creating
+    /// directories (like `unzip -j`). Name clashes follow --overwrite.
+    #[arg(short = 'j', long)]
+    junk_paths: bool,
+
     /// Quiet mode - only show errors
     #[arg(short, long)]
     quiet: bool,
@@ -263,7 +268,8 @@ fn extract_zip(
         .limits(limits)
         .overwrite(overwrite)
         .symlinks(symlinks)
-        .mode(mode);
+        .mode(mode)
+        .junk_paths(cli.junk_paths);
 
     // Apply filters
     if !cli.only_files.is_empty() {
@@ -334,7 +340,8 @@ fn extract_tar(
         .limits(limits)
         .overwrite(overwrite_mode)
         .symlinks(symlink_behavior)
-        .validation(validation);
+        .validation(validation)
+        .junk_paths(cli.junk_paths);
 
     // Apply filters
     if !cli.only_files.is_empty() {

@@ -76,6 +76,7 @@ If your zip files only come from trusted sources you control, the standard `zip`
 - **Archive Verification** — Check CRC32 integrity without extracting
 - **Multi-Format Support** — ZIP (core), TAR, and 7z (feature flags)
 - **Partial Extraction** — Extract specific files with `only()` or glob patterns
+- **Junk Paths** — Flatten everything into one directory, like `unzip -j`
 - **Progress Callbacks** — Monitor extraction progress (Rust API)
 - **Async API** — Optional tokio-based async extraction (feature flag)
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
@@ -163,6 +164,9 @@ safe_unzip archive.zip -d /var/uploads --include "**/*.py" --exclude "**/test_*"
 
 # Partial extraction
 safe_unzip archive.zip -d /var/uploads --only README.md --only LICENSE
+
+# Junk paths: every file straight into the destination, no directories
+safe_unzip archive.zip -d /var/uploads -j
 
 # Verbose output
 safe_unzip archive.zip -d /var/uploads -v
@@ -278,6 +282,37 @@ report = Extractor("/var/uploads").include_glob(["**/*.py"]).extract_file("archi
 # Exclude by pattern  
 report = Extractor("/var/uploads").exclude_glob(["**/__pycache__/**"]).extract_file("archive.zip")
 ```
+
+### Junk Paths (like `unzip -j`)
+
+Write every file directly into the destination under its base name, without creating directories:
+
+```rust
+use safe_unzip::Extractor;
+
+// docs/guide/intro.md -> /var/uploads/intro.md
+let report = Extractor::new("/var/uploads")?
+    .junk_paths(true)
+    .extract_file("archive.zip")?;
+```
+
+```python
+report = Extractor("/var/uploads").junk_paths().extract_file("archive.zip")
+```
+
+All security checks (filename rules, path traversal, depth limit) and filters (`only`, `include_glob`, `exclude_glob`) still apply to each entry's **full** archive path; only where the file is written changes. Directory entries are skipped.
+
+When two entries share a base name (`a/x.txt`, `b/x.txt`), the overwrite policy decides:
+
+| Policy | Result |
+|--------|--------|
+| `Error` (default) | Fails with `Error::PathCollision` naming both entries (Python: `AlreadyExistsError`). With `ValidateFirst`, nothing is written. |
+| `Skip` | Keeps the first |
+| `Overwrite` | Keeps the last |
+
+Unlike `unzip -j`, there is no interactive prompt.
+
+Works with `Extractor`, `AsyncExtractor`, and `Driver` (ZIP, TAR, 7z).
 
 ### Progress Callbacks
 

@@ -52,6 +52,7 @@ pub struct AsyncExtractor {
     overwrite: OverwritePolicy,
     symlinks: SymlinkPolicy,
     mode: ExtractionMode,
+    junk_paths: bool,
     create_destination: bool,
 }
 
@@ -73,6 +74,7 @@ impl AsyncExtractor {
             overwrite: OverwritePolicy::default(),
             symlinks: SymlinkPolicy::default(),
             mode: ExtractionMode::default(),
+            junk_paths: false,
             create_destination: false,
         })
     }
@@ -89,6 +91,7 @@ impl AsyncExtractor {
             overwrite: OverwritePolicy::default(),
             symlinks: SymlinkPolicy::default(),
             mode: ExtractionMode::default(),
+            junk_paths: false,
             create_destination: true,
         })
     }
@@ -138,6 +141,13 @@ impl AsyncExtractor {
     /// Set extraction mode.
     pub fn mode(mut self, mode: ExtractionMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Write every file at the destination root under its base name, without
+    /// creating directories. See [`Extractor::junk_paths`].
+    pub fn junk_paths(mut self, junk: bool) -> Self {
+        self.junk_paths = junk;
         self
     }
 
@@ -231,7 +241,8 @@ impl AsyncExtractor {
             .limits(self.limits)
             .overwrite(self.overwrite)
             .symlinks(self.symlinks)
-            .mode(self.mode))
+            .mode(self.mode)
+            .junk_paths(self.junk_paths))
     }
 
     #[cfg(feature = "tar")]
@@ -246,7 +257,8 @@ impl AsyncExtractor {
             .limits(self.limits)
             .overwrite(convert_overwrite_policy(self.overwrite))
             .symlinks(convert_symlink_policy(self.symlinks))
-            .validation(convert_extraction_mode(self.mode)))
+            .validation(convert_extraction_mode(self.mode))
+            .junk_paths(self.junk_paths))
     }
 }
 
