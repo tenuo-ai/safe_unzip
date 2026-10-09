@@ -149,6 +149,18 @@ class Extractor:
         self._inner.mode(mode)
         return self
     
+    def junk_paths(self, junk: bool = True) -> "Extractor":
+        """Write every file into the destination without creating directories.
+        
+        Like ``unzip -j``: ``docs/guide/intro.md`` is written as ``intro.md``.
+        All security checks still use the full archive path. When two entries
+        share a name, the overwrite policy decides: 'error' (default) raises
+        AlreadyExistsError naming both, 'skip' keeps the first, 'overwrite'
+        keeps the last.
+        """
+        self._inner.junk_paths(junk)
+        return self
+    
     # Filter methods
     def only(self, names: list[str]) -> "Extractor":
         """Extract only specific files by exact name (case-sensitive).
@@ -367,6 +379,11 @@ class AsyncExtractor:
     def mode(self, mode: _ExtractionMode) -> "AsyncExtractor":
         """Set extraction mode: 'streaming' or 'validate_first'."""
         self._extractor.mode(mode)
+        return self
+    
+    def junk_paths(self, junk: bool = True) -> "AsyncExtractor":
+        """Write every file into the destination without creating directories."""
+        self._extractor.junk_paths(junk)
         return self
     
     # Filter methods

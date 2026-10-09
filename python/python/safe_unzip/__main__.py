@@ -132,6 +132,7 @@ def extract_archive(
     overwrite: str = "error",
     symlinks: str = "skip",
     validate_first: bool = False,
+    junk_paths: bool = False,
     quiet: bool = False,
     verbose: bool = False,
 ) -> int:
@@ -153,6 +154,8 @@ def extract_archive(
         
         if validate_first:
             extractor = extractor.mode("validate_first")
+        if junk_paths:
+            extractor = extractor.junk_paths(True)
         
         if only_files:
             extractor = extractor.only(only_files)
@@ -207,6 +210,7 @@ def main() -> int:
     parser.add_argument("--overwrite", choices=["error", "skip", "overwrite"], default="error", help="What to do if file exists")
     parser.add_argument("--symlinks", choices=["skip", "error"], default="skip", help="What to do with symlinks")
     parser.add_argument("--validate-first", action="store_true", help="Validate all entries before extracting")
+    parser.add_argument("-j", "--junk-paths", action="store_true", help="Extract files without creating directories (like unzip -j)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
     
@@ -238,6 +242,7 @@ def main() -> int:
         overwrite=args.overwrite,
         symlinks=args.symlinks,
         validate_first=args.validate_first,
+        junk_paths=args.junk_paths,
         quiet=args.quiet,
         verbose=args.verbose,
     )

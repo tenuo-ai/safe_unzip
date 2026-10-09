@@ -14,6 +14,7 @@ use crate::adapter::ZipAdapter;
 use crate::copy::copy_entry;
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
+use crate::flatten::{base_name, FlatNames};
 use crate::limits::Limits;
 use crate::partial::PartialFile;
 use crate::policy::{
@@ -83,6 +84,8 @@ pub struct Driver {
     symlinks: SymlinkBehavior,
     /// Validation strategy.
     validation: ValidationMode,
+    /// Write files at the destination root under their base names.
+    junk_paths: bool,
     /// Optional entry filter.
     #[allow(clippy::type_complexity)]
     filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
@@ -118,6 +121,7 @@ impl Driver {
             overwrite: OverwriteMode::default(),
             symlinks: SymlinkBehavior::default(),
             validation: ValidationMode::default(),
+            junk_paths: false,
             filter: None,
         })
     }
@@ -144,6 +148,55 @@ impl Driver {
     pub fn validation(mut self, mode: ValidationMode) -> Self {
         self.validation = mode;
         self
+    }
+
+    /// Write every file at the destination root under its base name, without
+    /// creating directories (like `unzip -j`).
+    ///
+    /// All checks (path policy, depth, filters) still run on each entry's full
+    /// archive path. Directory entries are skipped. When two entries share a
+    /// base name, the overwrite mode decides: `Error` (the default) fails with
+    /// [`Error::PathCollision`] naming both entries (before anything is written
+    /// in `ValidateFirst` mode), `Skip` keeps the first, and `Overwrite` keeps
+    /// the last.
+    pub fn junk_paths(mut self, junk: bool) -> Self {
+        self.junk_paths = junk;
+        self
+    }
+
+    /// Where an entry is written. With junk paths, files go to the
+    /// destination root under their base name.
+    fn output_path(&self, info: &EntryInfo, flat: &mut FlatNames) -> Result<PathBuf, Error> {
+        if !self.junk_paths || !matches!(info.kind, EntryKind::File) {
+            return Ok(self.destination.join(&info.name));
+        }
+        let base = base_name(&info.name)?;
+        if self.overwrite == OverwriteMode::Error {
+            flat.claim(&base, &info.name)?;
+        }
+        Ok(self.destination.join(base))
+    }
+
+    /// In junk-paths mode with `OverwriteMode::Error`, fail before writing if
+    /// two file entries the filter keeps share a base name.
+    fn check_collisions<'a>(
+        &self,
+        entries: impl IntoIterator<Item = &'a EntryInfo>,
+    ) -> Result<(), Error> {
+        if !self.junk_paths || self.overwrite != OverwriteMode::Error {
+            return Ok(());
+        }
+        let mut flat = FlatNames::default();
+        for info in entries {
+            if !matches!(info.kind, EntryKind::File) {
+                continue;
+            }
+            if self.filter.as_ref().is_some_and(|keep| !keep(info)) {
+                continue;
+            }
+            flat.claim(&base_name(&info.name)?, &info.name)?;
+        }
+        Ok(())
     }
 
     /// Set entry filter.
@@ -246,9 +299,10 @@ impl Driver {
         }
 
         let mut state = ExtractionState::default();
+        let mut flat = FlatNames::default();
 
         for i in 0..adapter.len() {
-            self.extract_zip_entry(&mut adapter, i, &policies, &mut state)?;
+            self.extract_zip_entry(&mut adapter, i, &policies, &mut state, &mut flat)?;
         }
 
         Ok(ExtractionReport {
@@ -266,6 +320,7 @@ impl Driver {
         policies: &PolicyChain,
     ) -> Result<(), Error> {
         let entries = adapter.entries_metadata()?;
+        self.check_collisions(&entries)?;
         let mut state = ExtractionState::default();
 
         for info in entries {
@@ -295,6 +350,7 @@ impl Driver {
         index: usize,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        flat: &mut FlatNames,
     ) -> Result<(), Error> {
         let info = adapter.entry_info(index)?;
 
@@ -315,10 +371,12 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.destination.join(&info.name);
+        let safe_path = self.output_path(&info, flat)?;
 
         // Extract based on entry type
         match info.kind {
+            // Junk paths: no directories are created.
+            EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
                 // For directories, just create (idempotent)
                 fs::create_dir_all(&safe_path)?;
@@ -439,10 +497,13 @@ impl Driver {
                 }
             }
 
+            self.check_collisions(&entries)?;
+
             // Extract from cache
             let mut state = ExtractionState::default();
+            let mut flat = FlatNames::default();
             adapter.extract_cached(|info, data| {
-                self.extract_tar_entry_data(&info, data, &policies, &mut state)?;
+                self.extract_tar_entry_data(&info, data, &policies, &mut state, &mut flat)?;
                 Ok(true)
             })?;
 
@@ -456,9 +517,10 @@ impl Driver {
 
         // Streaming mode: extract as we read
         let mut state = ExtractionState::default();
+        let mut flat = FlatNames::default();
 
         adapter.for_each(|info, reader| {
-            self.extract_tar_entry(&info, reader, &policies, &mut state)?;
+            self.extract_tar_entry(&info, reader, &policies, &mut state, &mut flat)?;
             Ok(true)
         })?;
 
@@ -478,6 +540,7 @@ impl Driver {
         reader: Option<&mut dyn Read>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        flat: &mut FlatNames,
     ) -> Result<(), Error> {
         // Apply filter
         if let Some(ref filter) = self.filter {
@@ -496,9 +559,11 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.destination.join(&info.name);
+        let safe_path = self.output_path(info, flat)?;
 
         match info.kind {
+            // Junk paths: no directories are created.
+            EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
                 fs::create_dir_all(&safe_path)?;
                 state.dirs_created += 1;
@@ -550,6 +615,7 @@ impl Driver {
         data: Option<&[u8]>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        flat: &mut FlatNames,
     ) -> Result<(), Error> {
         // Apply filter
         if let Some(ref filter) = self.filter {
@@ -568,9 +634,11 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.destination.join(&info.name);
+        let safe_path = self.output_path(info, flat)?;
 
         match info.kind {
+            // Junk paths: no directories are created.
+            EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
                 fs::create_dir_all(&safe_path)?;
                 state.dirs_created += 1;
@@ -701,8 +769,9 @@ impl Driver {
         }
 
         let mut state = ExtractionState::default();
+        let mut flat = FlatNames::default();
         adapter.for_each(|info, reader| {
-            self.extract_7z_entry(info, reader, &policies, &mut state)?;
+            self.extract_7z_entry(info, reader, &policies, &mut state, &mut flat)?;
             Ok(true)
         })?;
 
@@ -721,8 +790,10 @@ impl Driver {
         adapter: &mut crate::adapter::SevenZAdapter,
         policies: &PolicyChain,
     ) -> Result<(), Error> {
+        let entries = adapter.entries_metadata();
+        self.check_collisions(&entries)?;
         let mut state = ExtractionState::default();
-        for info in adapter.entries_metadata() {
+        for info in entries {
             policies.check_all(&info, &state)?;
             if matches!(info.kind, EntryKind::File) {
                 state.bytes_written += info.size;
@@ -744,6 +815,7 @@ impl Driver {
         reader: Option<&mut dyn Read>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        flat: &mut FlatNames,
     ) -> Result<(), Error> {
         // Apply filter
         if let Some(ref filter) = self.filter {
@@ -756,9 +828,11 @@ impl Driver {
         // Validate with policies
         policies.check_all(info, state)?;
 
-        let safe_path = self.destination.join(&info.name);
+        let safe_path = self.output_path(info, flat)?;
 
         match info.kind {
+            // Junk paths: no directories are created.
+            EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
                 fs::create_dir_all(&safe_path)?;
                 state.dirs_created += 1;

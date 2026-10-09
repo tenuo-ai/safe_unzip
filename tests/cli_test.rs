@@ -105,6 +105,27 @@ fn test_cli_extract() {
 }
 
 #[test]
+fn test_cli_junk_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = create_test_zip(temp.path());
+    let dest = temp.path().join("output");
+    fs::create_dir(&dest).unwrap();
+
+    let output = cli_binary()
+        .arg(&zip_path)
+        .arg("-d")
+        .arg(&dest)
+        .arg("-j")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output);
+    assert!(dest.join("hello.txt").exists());
+    assert!(dest.join("nested.txt").exists());
+    assert!(!dest.join("subdir").exists());
+}
+
+#[test]
 fn test_cli_extract_verbose() {
     let temp = tempfile::tempdir().unwrap();
     let zip_path = create_test_zip(temp.path());

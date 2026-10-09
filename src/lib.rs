@@ -1,6 +1,7 @@
 mod copy;
 mod error;
 mod extractor;
+mod flatten;
 mod limits;
 mod partial;
 

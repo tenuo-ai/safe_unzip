@@ -64,6 +64,14 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
         safe_unzip::Error::AlreadyExists { entry } => {
             AlreadyExistsError::new_err(format!("file '{}' already exists", entry))
         }
+        safe_unzip::Error::PathCollision {
+            entry,
+            previous,
+            path,
+        } => AlreadyExistsError::new_err(format!(
+            "entries '{}' and '{}' both extract to '{}' (junk paths)",
+            previous, entry, path
+        )),
         safe_unzip::Error::InvalidFilename { entry, reason } => {
             PathEscapeError::new_err(format!("invalid filename '{}': {}", entry, reason))
         }
@@ -221,6 +229,7 @@ struct PyExtractor {
     overwrite: String,
     symlinks: String,
     mode: String,
+    junk_paths: bool,
     // Filter options
     only_names: Option<Vec<String>>,
     include_patterns: Option<Vec<String>>,
@@ -243,6 +252,7 @@ impl PyExtractor {
             overwrite: "error".to_string(),
             symlinks: "skip".to_string(),
             mode: "streaming".to_string(),
+            junk_paths: false,
             only_names: None,
             include_patterns: None,
             exclude_patterns: None,
@@ -309,6 +319,13 @@ impl PyExtractor {
                 "mode must be 'streaming' or 'validate_first'",
             )),
         }
+    }
+
+    /// Write every file into the destination without creating directories
+    /// (like `unzip -j`). Name clashes follow the overwrite policy.
+    fn junk_paths(mut slf: PyRefMut<'_, Self>, junk: bool) -> PyRefMut<'_, Self> {
+        slf.junk_paths = junk;
+        slf
     }
 
     /// Extract only specific files by exact name.
@@ -452,6 +469,7 @@ impl PyExtractor {
             "validate_first" => extractor.mode(safe_unzip::ExtractionMode::ValidateFirst),
             _ => extractor.mode(safe_unzip::ExtractionMode::Streaming),
         };
+        extractor = extractor.junk_paths(self.junk_paths);
 
         // Apply filters
         if let Some(ref names) = self.only_names {
@@ -510,6 +528,7 @@ impl PyExtractor {
             "validate_first" => driver.validation(safe_unzip::ValidationMode::ValidateFirst),
             _ => driver.validation(safe_unzip::ValidationMode::Streaming),
         };
+        driver = driver.junk_paths(self.junk_paths);
 
         // Apply filters
         if let Some(ref names) = self.only_names {

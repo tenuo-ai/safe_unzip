@@ -955,3 +955,72 @@ async def test_async_filter(tmp_path):
     assert (tmp_path / "keep.txt").exists()
     assert not (tmp_path / "skip.txt").exists()
 
+
+
+# ============================================================================
+# Junk Paths (unzip -j)
+# ============================================================================
+
+def test_junk_paths_flattens(tmp_path):
+    """Files land at the destination root; no directories are created."""
+    zip_data = create_multi_file_zip({
+        "docs/guide/intro.md": b"intro",
+        "src/main.rs": b"fn main() {}",
+    })
+
+    report = Extractor(tmp_path).junk_paths().extract_bytes(zip_data)
+
+    assert report.files_extracted == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["intro.md", "main.rs"]
+    assert (tmp_path / "intro.md").read_bytes() == b"intro"
+
+
+def test_junk_paths_collision_raises(tmp_path):
+    """Two entries with the same base name are reported together."""
+    zip_data = create_multi_file_zip({"a/x.txt": b"first", "b/x.txt": b"second"})
+
+    with pytest.raises(AlreadyExistsError, match="a/x.txt.*b/x.txt"):
+        Extractor(tmp_path).junk_paths().mode("validate_first").extract_bytes(zip_data)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_junk_paths_overwrite_keeps_last(tmp_path):
+    zip_data = create_multi_file_zip({"a/x.txt": b"first", "b/x.txt": b"second"})
+
+    Extractor(tmp_path).junk_paths().overwrite("overwrite").extract_bytes(zip_data)
+
+    assert (tmp_path / "x.txt").read_bytes() == b"second"
+
+
+def test_junk_paths_tar(tmp_path):
+    tar_data = create_simple_tar("pkg/lib/a.txt", b"a")
+
+    Extractor(tmp_path).junk_paths().extract_tar_bytes(tar_data)
+
+    assert [p.name for p in tmp_path.iterdir()] == ["a.txt"]
+
+
+def test_junk_paths_still_blocks_traversal(tmp_path):
+    zip_data = create_simple_zip("../evil.txt", b"evil")
+
+    with pytest.raises(PathEscapeError):
+        Extractor(tmp_path).junk_paths().extract_bytes(zip_data)
+
+
+def test_cli_junk_paths(tmp_path):
+    import subprocess
+    import sys
+
+    archive = tmp_path / "a.zip"
+    archive.write_bytes(create_multi_file_zip({"deep/dir/file.txt": b"x"}))
+    dest = tmp_path / "out"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "safe_unzip", str(archive), "-d", str(dest), "-j", "-q"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [p.name for p in dest.iterdir()] == ["file.txt"]

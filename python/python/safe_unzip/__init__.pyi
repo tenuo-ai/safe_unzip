@@ -128,6 +128,10 @@ class Extractor:
         """Set extraction mode: 'streaming' or 'validate_first'."""
         ...
     
+    def junk_paths(self, junk: bool = True) -> "Extractor":
+        """Write every file into the destination without creating directories (like `unzip -j`)."""
+        ...
+    
     def only(self, names: list[str]) -> "Extractor":
         """Extract only specific files by exact name (case-sensitive)."""
         ...
@@ -222,6 +226,10 @@ class AsyncExtractor:
     
     def mode(self, mode: _ExtractionMode) -> "AsyncExtractor":
         """Set extraction mode: 'streaming' or 'validate_first'."""
+        ...
+    
+    def junk_paths(self, junk: bool = True) -> "AsyncExtractor":
+        """Write every file into the destination without creating directories (like `unzip -j`)."""
         ...
     
     def only(self, names: list[str]) -> "AsyncExtractor":
