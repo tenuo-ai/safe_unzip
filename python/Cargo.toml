@@ -13,5 +13,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 safe_unzip = { path = "..", features = ["tar", "sevenz"] }
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
 flate2 = "1"  # For .tar.gz support
