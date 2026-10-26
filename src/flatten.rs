@@ -7,10 +7,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use unicode_casefold::UnicodeCaseFold;
-use unicode_normalization::UnicodeNormalization;
-
 use crate::error::Error;
+use crate::portable::fold;
 
 /// The name a file entry is written under when paths are junked.
 pub(crate) fn base_name(entry: &str) -> Result<PathBuf, Error> {
@@ -51,11 +49,7 @@ impl FlatNames {
 /// common case-insensitive or Unicode-normalizing destination filesystems.
 fn collision_key(base: &Path) -> String {
     let name = base.to_string_lossy();
-    name.trim_end_matches([' ', '.'])
-        .nfd()
-        .case_fold()
-        .nfc()
-        .collect()
+    fold(name.trim_end_matches([' ', '.']))
 }
 
 #[cfg(test)]

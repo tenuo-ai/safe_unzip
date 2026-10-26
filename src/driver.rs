@@ -28,6 +28,7 @@ use crate::policy::{
     CountPolicy, DepthPolicy, ExtractionState, PathPolicy, PolicyChain, SizePolicy,
     SymlinkBehavior, SymlinkPolicy,
 };
+use crate::portable::glob_matches_folded;
 
 /// What to do when a file already exists at the extraction path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -287,6 +288,10 @@ impl Driver {
 
     /// Exclude files matching glob patterns.
     ///
+    /// Patterns also match names that differ only in letter case or Unicode
+    /// normalization, since those refer to the same file on case-insensitive
+    /// filesystems (macOS, Windows).
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -300,11 +305,7 @@ impl Driver {
     /// ```
     pub fn exclude_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
         let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
-        self.filter(move |entry| {
-            !patterns
-                .iter()
-                .any(|p| glob_match::glob_match(p, &entry.name))
-        })
+        self.filter(move |entry| !patterns.iter().any(|p| glob_matches_folded(p, &entry.name)))
     }
 
     /// Build the policy chain from current settings.

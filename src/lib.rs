@@ -5,6 +5,7 @@ mod extractor;
 mod flatten;
 mod limits;
 mod partial;
+mod portable;
 
 // New architecture modules (v0.2)
 pub mod adapter;
