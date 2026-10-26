@@ -27,7 +27,7 @@ path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [dependencies]
-path_jail = "0.5"
+path_jail = { version = "0.5", features = ["guard"] }
 clap = { version = "4", features = ["derive"], optional = true }
 clap_complete = { version = "4", optional = true }
 # Use minimal zip features to avoid heavy compression dependencies

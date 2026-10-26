@@ -1,4 +1,5 @@
 mod copy;
+mod dest;
 mod error;
 mod extractor;
 mod flatten;
