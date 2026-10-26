@@ -54,15 +54,17 @@ fn variant_zip() -> Vec<u8> {
         ("cafe\u{301}/notes.txt", b"d"),
         ("caf\u{e9}.TXT", b"e"),
         ("_.TXT", b"f"),
+        ("q.DAT", b"g"),
     ])
 }
 
-const EXCLUDES: [&str; 5] = [
+const EXCLUDES: [&str; 6] = [
     "**/.git/**",
     "**/*.exe",
     "caf\u{e9}/**",
     "cafe*.txt",
     "[A-z].txt",
+    "[A-Z].dat",
 ];
 
 #[test]

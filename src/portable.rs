@@ -22,7 +22,7 @@ pub(crate) fn glob_matches_folded(pattern: &str, name: &str) -> bool {
         || glob_match::glob_match(&fold_glob_literals(pattern), &fold_for_glob(name))
 }
 
-/// Fold literal portions of a glob while leaving character classes intact.
+/// Fold literal portions of a glob while preserving character-class meaning.
 ///
 /// Normalizing an entire glob changes its syntax: for example, folding
 /// `[A-z]` into `[a-z]` removes punctuation from the range. Using NFD here
@@ -42,7 +42,7 @@ fn fold_glob_literals(pattern: &str) -> String {
         if bytes[i] == b'[' {
             if let Some(end) = character_class_end(bytes, i + 1) {
                 out.push_str(&fold_for_glob(&pattern[literal_start..i]));
-                out.push_str(&pattern[i..=end]);
+                out.push_str(&fold_character_class(&pattern[i..=end]));
                 i = end + 1;
                 literal_start = i;
                 continue;
@@ -57,6 +57,38 @@ fn fold_glob_literals(pattern: &str) -> String {
 
 fn fold_for_glob(s: &str) -> String {
     s.nfd().case_fold().collect()
+}
+
+/// Add folded members to a character class without replacing its original
+/// ranges. `[A-Z]` becomes `[A-Za-z]`, while `[A-z]` keeps the punctuation
+/// between `Z` and `a` and becomes `[A-za-z]`. The same combined member set
+/// works for negated classes because it excludes both forms.
+fn fold_character_class(class: &str) -> String {
+    let inner = &class[1..class.len() - 1];
+    let (negation, body) = match inner.as_bytes().first() {
+        Some(b'!') | Some(b'^') => (&inner[..1], &inner[1..]),
+        _ => ("", inner),
+    };
+    // A closing bracket is literal when it is the first class member. Keep it
+    // first and only once so the appended folded members cannot close the
+    // class early.
+    let (leading_bracket, rest) = if let Some(rest) = body.strip_prefix(']') {
+        ("]", rest)
+    } else {
+        ("", body)
+    };
+    let folded = fold_for_glob(rest);
+
+    let mut out = String::with_capacity(class.len() + folded.len());
+    out.push('[');
+    out.push_str(negation);
+    out.push_str(leading_bracket);
+    out.push_str(rest);
+    if folded != rest {
+        out.push_str(&folded);
+    }
+    out.push(']');
+    out
 }
 
 fn character_class_end(bytes: &[u8], mut i: usize) -> Option<usize> {
@@ -128,6 +160,9 @@ mod tests {
         assert!(glob_matches_folded("**/caf\u{e9}/**", "cafe\u{301}/a"));
         assert!(glob_matches_folded("cafe*.txt", "caf\u{e9}.TXT"));
         assert!(glob_matches_folded("[A-z].txt", "_.TXT"));
+        assert!(glob_matches_folded("[A].txt", "a.TXT"));
+        assert!(glob_matches_folded("[A-Z].dat", "q.DAT"));
+        assert!(!glob_matches_folded("[!A-Z].dat", "q.DAT"));
         assert!(!glob_matches_folded("**/.git/**", "x/git/config"));
     }
 
