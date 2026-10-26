@@ -16,6 +16,9 @@ use crate::adapter::TarAdapter;
 use crate::adapter::ZipAdapter;
 #[cfg(feature = "sevenz")]
 use crate::copy::copy_entry;
+#[cfg(unix)]
+use crate::dest::set_mode;
+use crate::dest::{relative, Destination, IfExists};
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 use crate::flatten::{base_name, FlatNames};
@@ -80,6 +83,8 @@ pub struct ExtractionReport {
 pub struct Driver {
     /// Destination directory.
     destination: PathBuf,
+    /// Writes beneath the destination.
+    dest: Destination,
     /// Path jail rooted at the destination.
     jail: Jail,
     /// Security limits.
@@ -124,6 +129,7 @@ impl Driver {
         let jail = Jail::new(destination)?;
         Ok(Self {
             destination: destination.to_path_buf(),
+            dest: Destination::new(destination),
             jail,
             limits: Limits::default(),
             overwrite: OverwriteMode::default(),
@@ -172,11 +178,11 @@ impl Driver {
         self
     }
 
-    /// Where an entry is written. With junk paths, files go to the
-    /// destination root under their base name.
+    /// Where an entry is written, relative to the destination. With junk
+    /// paths, files go to the destination root under their base name.
     fn output_path(&self, info: &EntryInfo, flat: &mut FlatNames) -> Result<PathBuf, Error> {
         if !self.junk_paths || !matches!(info.kind, EntryKind::File) {
-            return Ok(self.destination.join(&info.name));
+            return Ok(relative(&info.name));
         }
         let base = base_name(&info.name)?;
         self.jail.join(&base).map_err(|e| Error::PathEscape {
@@ -186,7 +192,7 @@ impl Driver {
         if self.overwrite == OverwriteMode::Error {
             flat.claim(&base, &info.name)?;
         }
-        Ok(self.destination.join(base))
+        Ok(base)
     }
 
     /// In junk-paths mode, validate every kept file's flattened name before
@@ -407,7 +413,7 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.output_path(&info, flat)?;
+        let rel = self.output_path(&info, flat)?;
 
         // Extract based on entry type
         match info.kind {
@@ -415,60 +421,19 @@ impl Driver {
             EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
                 // For directories, just create (idempotent)
-                fs::create_dir_all(&safe_path)?;
+                self.dest.create_dir_all(&rel)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if let Some(parent) = rel.parent() {
+                    self.dest.create_dir_all(parent)?;
                 }
 
-                // Atomic file creation based on overwrite mode
-                let outfile = match self.overwrite {
-                    OverwriteMode::Error => {
-                        // create_new(true) is atomic: fails if file exists (no TOCTOU)
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                return Err(Error::AlreadyExists {
-                                    entry: safe_path.display().to_string(),
-                                });
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    OverwriteMode::Skip => {
-                        // Try atomic create, skip on exists
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                state.entries_skipped += 1;
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    OverwriteMode::Overwrite => {
-                        // SECURITY: Remove any existing symlink first to prevent following
-                        if let Ok(m) = fs::symlink_metadata(&safe_path) {
-                            if m.file_type().is_symlink() {
-                                fs::remove_file(&safe_path)?;
-                            }
-                        }
-                        // Now create/truncate
-                        fs::File::create(&safe_path)?
-                    }
+                let Some(outfile) = self.open_for_write(&rel, state)? else {
+                    return Ok(()); // Skipped
                 };
 
-                let partial = PartialFile::new(&safe_path);
+                let partial = PartialFile::new(&self.dest, &rel);
                 let mut outfile = outfile;
                 let limit = self.limits.max_single_file.min(
                     self.limits
@@ -481,9 +446,7 @@ impl Driver {
                 // Set permissions on Unix
                 #[cfg(unix)]
                 if let Some(mode) = info.mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
+                    set_mode(&outfile, mode)?;
                 }
                 partial.commit();
 
@@ -606,25 +569,25 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.output_path(info, flat)?;
+        let rel = self.output_path(info, flat)?;
 
         match info.kind {
             // Junk paths: no directories are created.
             EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
-                fs::create_dir_all(&safe_path)?;
+                self.dest.create_dir_all(&rel)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if let Some(parent) = rel.parent() {
+                    self.dest.create_dir_all(parent)?;
                 }
 
-                let outfile = self.open_for_write(&safe_path, state)?;
+                let outfile = self.open_for_write(&rel, state)?;
                 let Some(mut outfile) = outfile else {
                     return Ok(()); // Skipped
                 };
-                let partial = PartialFile::new(&safe_path);
+                let partial = PartialFile::new(&self.dest, &rel);
 
                 if let Some(reader) = reader {
                     let limit = self.limits.max_single_file.min(
@@ -638,9 +601,7 @@ impl Driver {
 
                 #[cfg(unix)]
                 if let Some(mode) = info.mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
+                    set_mode(&outfile, mode)?;
                 }
                 partial.commit();
 
@@ -680,25 +641,25 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.output_path(info, flat)?;
+        let rel = self.output_path(info, flat)?;
 
         match info.kind {
             // Junk paths: no directories are created.
             EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
-                fs::create_dir_all(&safe_path)?;
+                self.dest.create_dir_all(&rel)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if let Some(parent) = rel.parent() {
+                    self.dest.create_dir_all(parent)?;
                 }
 
-                let outfile = self.open_for_write(&safe_path, state)?;
+                let outfile = self.open_for_write(&rel, state)?;
                 let Some(mut outfile) = outfile else {
                     return Ok(()); // Skipped
                 };
-                let partial = PartialFile::new(&safe_path);
+                let partial = PartialFile::new(&self.dest, &rel);
 
                 if let Some(data) = data {
                     use std::io::Write;
@@ -708,9 +669,7 @@ impl Driver {
 
                 #[cfg(unix)]
                 if let Some(mode) = info.mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
+                    set_mode(&outfile, mode)?;
                 }
                 partial.commit();
 
@@ -724,53 +683,23 @@ impl Driver {
         Ok(())
     }
 
-    /// Open a file for writing based on overwrite policy.
+    /// Create a file for writing based on the overwrite mode.
     /// Returns None if the file should be skipped.
-    #[cfg(any(feature = "tar", feature = "sevenz"))]
     fn open_for_write(
         &self,
-        path: &Path,
+        rel: &Path,
         state: &mut ExtractionState,
     ) -> Result<Option<fs::File>, Error> {
-        match self.overwrite {
-            OverwriteMode::Error => {
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                {
-                    Ok(f) => Ok(Some(f)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        Err(Error::AlreadyExists {
-                            entry: path.display().to_string(),
-                        })
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            OverwriteMode::Skip => {
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                {
-                    Ok(f) => Ok(Some(f)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        state.entries_skipped += 1;
-                        Ok(None)
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            OverwriteMode::Overwrite => {
-                if let Ok(m) = fs::symlink_metadata(path) {
-                    if m.file_type().is_symlink() {
-                        fs::remove_file(path)?;
-                    }
-                }
-                Ok(Some(fs::File::create(path)?))
-            }
+        let if_exists = match self.overwrite {
+            OverwriteMode::Error => IfExists::Error,
+            OverwriteMode::Skip => IfExists::Skip,
+            OverwriteMode::Overwrite => IfExists::Replace,
+        };
+        let file = self.dest.create_file(rel, if_exists)?;
+        if file.is_none() {
+            state.entries_skipped += 1;
         }
+        Ok(file)
     }
 
     /// Convenience: extract TAR from a file path.
@@ -897,25 +826,25 @@ impl Driver {
         // Validate with policies
         policies.check_all(info, state)?;
 
-        let safe_path = self.output_path(info, flat)?;
+        let rel = self.output_path(info, flat)?;
 
         match info.kind {
             // Junk paths: no directories are created.
             EntryKind::Directory if self.junk_paths => {}
             EntryKind::Directory => {
-                fs::create_dir_all(&safe_path)?;
+                self.dest.create_dir_all(&rel)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if let Some(parent) = rel.parent() {
+                    self.dest.create_dir_all(parent)?;
                 }
 
-                let outfile = self.open_for_write(&safe_path, state)?;
+                let outfile = self.open_for_write(&rel, state)?;
                 let Some(mut outfile) = outfile else {
                     return Ok(()); // Skipped
                 };
-                let partial = PartialFile::new(&safe_path);
+                let partial = PartialFile::new(&self.dest, &rel);
 
                 if let Some(reader) = reader {
                     let limit = self.limits.max_single_file.min(

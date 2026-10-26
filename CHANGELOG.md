@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Writes are resolved beneath the destination handle on Linux 5.6+.**
+  Directory creation, file creation, replacement and cleanup now go through
+  `path_jail`'s `FdJail` (`openat2(RESOLVE_BENEATH)`) on Linux x86_64/aarch64,
+  so every write stays inside the destination. Other platforms and older
+  kernels keep the existing path-based behaviour. Permission bits are now set
+  on the open file handle. With `Overwrite`, an existing file is replaced
+  (removed, then created) rather than truncated in place.
 - **Python CLI `--max-size`** ([#10](https://github.com/tenuo-ai/safe_unzip/issues/10)):
   `python -m safe_unzip --max-size ...` failed with `AttributeError`. It now
   sets the limit in exact bytes.
