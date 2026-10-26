@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Fallback writes revalidate normalized paths.** Platforms without guarded
+  `openat2` writes now resolve the normalized parent through the jail at the
+  write boundary, preventing `..` plus symlink aliases from redirecting a
+  write outside the destination.
+- Existing-directory checks on the guarded backend no longer open entries for
+  reading, avoiding FIFO hangs and allowing directories without read access.
+- Portable exclusion matching now handles large brace expressions without
+  Cartesian expansion and preserves wildcard boundaries across canonically
+  reordered combining marks.
 - **`exclude_glob` matches case and Unicode variants.** An exclude pattern now
   also matches names that differ only in letter case or Unicode
   normalization, which refer to the same file on macOS and Windows.
