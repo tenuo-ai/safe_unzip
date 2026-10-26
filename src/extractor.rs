@@ -1,5 +1,6 @@
 use crate::error::Error;
 use crate::limits::Limits;
+use crate::portable::{component_issue, glob_matches_folded};
 use path_jail::Jail;
 
 use crate::adapter::drain_checked;
@@ -320,6 +321,10 @@ impl Extractor {
     /// Patterns use standard glob syntax. A file is extracted only if it does NOT
     /// match ANY of the exclude patterns.
     ///
+    /// Patterns also match names that differ only in letter case or Unicode
+    /// normalization, since those refer to the same file on case-insensitive
+    /// filesystems (macOS, Windows).
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -333,11 +338,7 @@ impl Extractor {
     /// ```
     pub fn exclude_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
         let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
-        self.filter(move |entry| {
-            !patterns
-                .iter()
-                .any(|p| glob_match::glob_match(p, entry.name))
-        })
+        self.filter(move |entry| !patterns.iter().any(|p| glob_matches_folded(p, entry.name)))
     }
 
     /// Set a progress callback.
@@ -893,23 +894,12 @@ impl Extractor {
             return Err("path component too long (>255 bytes)");
         }
 
-        // Check path components for reserved names
-        let path = Path::new(name);
-        for component in path.components() {
+        // Names that change meaning on other filesystems (reserved names,
+        // trailing dots/spaces, ':' on Windows)
+        for component in Path::new(name).components() {
             if let Component::Normal(os_str) = component {
-                if let Some(s) = os_str.to_str() {
-                    // Windows reserved names
-                    let s_upper = s.to_ascii_uppercase();
-                    let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
-
-                    match file_stem {
-                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
-                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
-                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                            return Err("Windows reserved name");
-                        }
-                        _ => {}
-                    }
+                if let Some(issue) = os_str.to_str().and_then(component_issue) {
+                    return Err(issue);
                 }
             }
         }

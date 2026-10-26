@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`exclude_glob` matches case and Unicode variants.** An exclude pattern now
+  also matches names that differ only in letter case or Unicode
+  normalization, which refer to the same file on macOS and Windows.
+  `only` and `include_glob` still match exactly.
+- **Rejected filenames:** path components ending in a dot or space (Windows
+  drops these characters), and, on Windows, names containing `:`.
+  Reserved-name checks now also cover forms with trailing spaces.
 - **Python CLI `--max-size`** ([#10](https://github.com/tenuo-ai/safe_unzip/issues/10)):
   `python -m safe_unzip --max-size ...` failed with `AttributeError`. It now
   sets the limit in exact bytes.

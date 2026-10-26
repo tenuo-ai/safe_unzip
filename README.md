@@ -707,6 +707,10 @@ These filenames are **rejected** for security:
 - Paths longer than 1024 bytes
 - Path components longer than 255 bytes
 - Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
+- Path components ending in a dot or space (Windows drops these characters)
+- On Windows, names containing `:`
+
+`exclude_glob` patterns also match names that differ only in letter case or Unicode normalization (for example `.GIT/config` for `**/.git/**`), since those refer to the same file on macOS and Windows. `only` and `include_glob` match exactly.
 
 ## Development
 
