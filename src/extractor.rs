@@ -5,6 +5,9 @@ use path_jail::Jail;
 
 use crate::adapter::drain_checked;
 use crate::copy::copy_entry;
+#[cfg(unix)]
+use crate::dest::set_mode;
+use crate::dest::{relative, Destination, IfExists};
 use crate::flatten::{base_name, FlatNames};
 use crate::partial::PartialFile;
 use std::fs;
@@ -130,7 +133,7 @@ pub struct Progress {
 }
 
 pub struct Extractor {
-    root: std::path::PathBuf,
+    dest: Destination,
     jail: Jail,
     limits: Limits,
     overwrite: OverwritePolicy,
@@ -198,7 +201,7 @@ impl Extractor {
 
         let jail = Jail::new(destination)?;
         Ok(Self {
-            root: destination.to_path_buf(),
+            dest: Destination::new(destination)?,
             jail,
             limits: Limits::default(),
             overwrite: OverwritePolicy::default(),
@@ -422,8 +425,8 @@ impl Extractor {
                 detail: e.to_string(),
             })?;
 
-            // Construct safe_path manually to preserve symlinks in the path
-            let safe_path = self.root.join(&name);
+            // Where the entry is written, relative to the destination
+            let rel = relative(&name);
 
             // 2. CHECK: Symlinks
             if entry.is_symlink() {
@@ -501,8 +504,8 @@ impl Extractor {
             }
 
             // 6. Junk paths: drop directories, write files under their base name.
-            let safe_path = if !self.junk_paths {
-                safe_path
+            let rel = if !self.junk_paths {
+                rel
             } else if entry.is_dir() {
                 continue;
             } else {
@@ -514,62 +517,28 @@ impl Extractor {
                 if matches!(self.overwrite, OverwritePolicy::Error) {
                     flat.claim(&base, &name)?;
                 }
-                self.root.join(base)
+                base
             };
 
             // 7. EXECUTION
             if entry.is_dir() {
-                fs::create_dir_all(&safe_path)?;
+                self.dest.create_dir_all(&rel)?;
                 report.dirs_created += 1;
             } else {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if let Some(parent) = rel.parent() {
+                    self.dest.create_dir_all(parent)?;
                 }
 
-                // SECURITY: Atomic file creation based on overwrite policy
-                // Using create_new(true) eliminates TOCTOU race conditions
-                let outfile = match self.overwrite {
-                    OverwritePolicy::Error => {
-                        // create_new(true) is atomic: fails if file exists (no TOCTOU)
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                return Err(Error::AlreadyExists {
-                                    entry: safe_path.display().to_string(),
-                                });
-                            }
-                            Err(e) => return Err(Error::Io(e)),
-                        }
-                    }
-                    OverwritePolicy::Skip => {
-                        // Try atomic create, skip on exists
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                report.entries_skipped += 1;
-                                continue;
-                            }
-                            Err(e) => return Err(Error::Io(e)),
-                        }
-                    }
-                    OverwritePolicy::Overwrite => {
-                        // SECURITY: Remove any existing symlink first to prevent following
-                        if let Ok(m) = fs::symlink_metadata(&safe_path) {
-                            if m.file_type().is_symlink() {
-                                fs::remove_file(&safe_path)?;
-                            }
-                        }
-                        // Now create/truncate
-                        fs::File::create(&safe_path)?
-                    }
+                // Exclusive create; Overwrite removes the existing entry
+                // (never following a symlink) and creates a new file.
+                let if_exists = match self.overwrite {
+                    OverwritePolicy::Error => IfExists::Error,
+                    OverwritePolicy::Skip => IfExists::Skip,
+                    OverwritePolicy::Overwrite => IfExists::Replace,
+                };
+                let Some(outfile) = self.dest.create_file(&rel, if_exists)? else {
+                    report.entries_skipped += 1;
+                    continue;
                 };
 
                 // SECURITY: bounded copy
@@ -585,7 +554,7 @@ impl Extractor {
                     .saturating_sub(total_bytes_written);
                 let hard_limit = limit_single.min(remaining_global);
 
-                let partial = PartialFile::new(&safe_path);
+                let partial = PartialFile::new(&self.dest, &rel);
                 let mut outfile = outfile;
                 let copied = copy_entry(&mut entry, &mut outfile, hard_limit, &name)?;
                 let written = copied.written;
@@ -625,15 +594,10 @@ impl Extractor {
                 report.files_extracted += 1;
 
                 // Handle permissions on Unix
+                // Strips setuid, setgid and sticky bits
                 #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Some(mode) = entry.unix_mode() {
-                        // Strip setuid (0o4000), setgid (0o2000), sticky (0o1000) bits
-                        // 0o0777 mask keeps only owner/group/other rwx flags
-                        let safe_mode = mode & 0o0777;
-                        fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
-                    }
+                if let Some(mode) = entry.unix_mode() {
+                    set_mode(&outfile, mode)?;
                 }
                 partial.commit();
             }

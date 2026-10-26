@@ -5,6 +5,42 @@ use std::fmt;
 /// This enum is marked `#[non_exhaustive]` to allow adding new variants
 /// in minor versions without breaking existing code. Always include a
 /// catch-all `_ =>` arm when matching.
+///
+/// # Example
+///
+/// ```no_run
+/// use safe_unzip::{extract_file, Error};
+///
+/// match extract_file("/var/uploads", "archive.zip") {
+///     Ok(report) => {
+///         println!("Success: {} files", report.files_extracted);
+///     }
+///     Err(Error::PathEscape { entry, detail }) => {
+///         eprintln!("Blocked path traversal in '{}': {}", entry, detail);
+///     }
+///     Err(Error::TotalSizeExceeded { limit, would_be }) => {
+///         eprintln!("Archive too large: {} bytes (limit: {})", would_be, limit);
+///     }
+///     Err(Error::FileTooLarge { entry, size, limit }) => {
+///         eprintln!("File '{}' too large: {} bytes (limit: {})", entry, size, limit);
+///     }
+///     Err(Error::FileCountExceeded { limit, attempted }) => {
+///         eprintln!("Too many files (attempted {}, limit: {})", attempted, limit);
+///     }
+///     Err(Error::AlreadyExists { entry }) => {
+///         eprintln!("File already exists: {}", entry);
+///     }
+///     Err(Error::InvalidFilename { entry, .. }) => {
+///         eprintln!("Invalid filename: {}", entry);
+///     }
+///     Err(Error::EncryptedEntry { entry }) => {
+///         eprintln!("Encrypted entry not supported: {}", entry);
+///     }
+///     Err(e) => {
+///         eprintln!("Extraction failed: {}", e);
+///     }
+/// }
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {

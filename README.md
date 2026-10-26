@@ -637,17 +637,26 @@ match extract_file("/var/uploads", "archive.zip") {
     Err(Error::FileTooLarge { entry, size, limit }) => {
         eprintln!("File '{}' too large: {} bytes (limit: {})", entry, size, limit);
     }
-    Err(Error::FileCountExceeded { limit }) => {
-        eprintln!("Too many files (limit: {})", limit);
+    Err(Error::FileCountExceeded { limit, attempted }) => {
+        eprintln!("Too many files (attempted {}, limit: {})", attempted, limit);
     }
-    Err(Error::AlreadyExists { path }) => {
-        eprintln!("File already exists: {}", path);
+    Err(Error::AlreadyExists { entry }) => {
+        eprintln!("File already exists: {}", entry);
     }
     Err(Error::InvalidFilename { entry, .. }) => {
         eprintln!("Invalid filename: {}", entry);
     }
     Err(Error::EncryptedEntry { entry }) => {
         eprintln!("Encrypted entry not supported: {}", entry);
+    }
+    Err(Error::ChecksumMismatch { entry }) => {
+        eprintln!("Checksum mismatch for '{}'", entry);
+    }
+    Err(Error::PathCollision { entry, previous, path }) => {
+        eprintln!("Path collision: '{}' and '{}' both map to '{}'", entry, previous, path);
+    }
+    Err(Error::DecoderMemoryExceeded { required, limit }) => {
+        eprintln!("Decoder needs {} bytes (limit: {})", required, limit);
     }
     Err(e) => {
         eprintln!("Extraction failed: {}", e);
