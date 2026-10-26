@@ -6,6 +6,7 @@
 //! equivalent, and reject names whose meaning changes between platforms.
 
 use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
 
 /// Case-folded, NFC-normalized form of `s`, for comparing names the way
@@ -18,100 +19,388 @@ pub(crate) fn fold(s: &str) -> String {
 /// both. Used for exclusions, so an entry can't avoid an exclude pattern by
 /// differing only in case or Unicode normalization.
 pub(crate) fn glob_matches_folded(pattern: &str, name: &str) -> bool {
-    glob_match::glob_match(pattern, name)
-        || glob_match::glob_match(&fold_glob_literals(pattern), &fold_for_glob(name))
-}
-
-/// Fold literal portions of a glob while preserving character-class meaning.
-///
-/// Normalizing an entire glob changes its syntax: for example, folding
-/// `[A-z]` into `[a-z]` removes punctuation from the range. Using NFD here
-/// also lets a wildcard consume combining marks at a normalization boundary,
-/// so `cafe*.txt` matches both composed and decomposed forms of `café.txt`.
-fn fold_glob_literals(pattern: &str) -> String {
-    let bytes = pattern.as_bytes();
-    let mut out = String::with_capacity(pattern.len());
-    let mut literal_start = 0;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i = (i + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[i] == b'[' {
-            if let Some(end) = character_class_end(bytes, i + 1) {
-                out.push_str(&fold_for_glob(&pattern[literal_start..i]));
-                out.push_str(&fold_character_class(&pattern[i..=end]));
-                i = end + 1;
-                literal_start = i;
-                continue;
-            }
-        }
-        i += 1;
+    let negations = pattern.chars().take_while(|ch| *ch == '!').count();
+    let positive = &pattern[negations..];
+    let matched = glob_match::glob_match(positive, name) || equivalent_glob_match(positive, name);
+    if negations % 2 == 1 {
+        !matched
+    } else {
+        matched
     }
-
-    out.push_str(&fold_for_glob(&pattern[literal_start..]));
-    out
 }
 
 fn fold_for_glob(s: &str) -> String {
     s.nfd().case_fold().collect()
 }
 
-/// Add folded members to a character class without replacing its original
-/// ranges. `[A-Z]` becomes `[A-Za-z]`, while `[A-z]` keeps the punctuation
-/// between `Z` and `a` and becomes `[A-za-z]`. The same combined member set
-/// works for negated classes because it excludes both forms.
-fn fold_character_class(class: &str) -> String {
-    let inner = &class[1..class.len() - 1];
-    let (negation, body) = match inner.as_bytes().first() {
-        Some(b'!') | Some(b'^') => (&inner[..1], &inner[1..]),
-        _ => ("", inner),
-    };
-    // A closing bracket is literal when it is the first class member. Keep it
-    // first and only once so the appended folded members cannot close the
-    // class early.
-    let (leading_bracket, rest) = if let Some(rest) = body.strip_prefix(']') {
-        ("]", rest)
-    } else {
-        ("", body)
-    };
-    let folded = fold_for_glob(rest);
-
-    let mut out = String::with_capacity(class.len() + folded.len());
-    out.push('[');
-    out.push_str(negation);
-    out.push_str(leading_bracket);
-    out.push_str(rest);
-    if folded != rest {
-        out.push_str(&folded);
-    }
-    out.push(']');
-    out
+#[derive(Debug)]
+enum GlobToken {
+    Literal(String),
+    Separator,
+    Any,
+    Star,
+    GlobStar,
+    GlobStarDirectory,
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+    },
 }
 
-fn character_class_end(bytes: &[u8], mut i: usize) -> Option<usize> {
-    if i < bytes.len() && matches!(bytes[i], b'^' | b'!') {
+#[derive(Debug)]
+struct NameUnit {
+    text: String,
+    folded: String,
+    separator: bool,
+}
+
+/// Match a glob against any case- or normalization-equivalent spelling of a
+/// name. This is deliberately token-aware: folding raw glob text can change a
+/// range (`[A-f]`), turn a literal hyphen into a range, or split one Unicode
+/// class member into several code points.
+fn equivalent_glob_match(pattern: &str, name: &str) -> bool {
+    let Some(patterns) = expand_braces(pattern) else {
+        return false;
+    };
+    let units = name_units(name);
+    patterns.into_iter().any(|pattern| {
+        let Some(tokens) = tokenize_glob(&pattern) else {
+            return false;
+        };
+        match_tokens(&tokens, &units)
+    })
+}
+
+fn expand_braces(pattern: &str) -> Option<Vec<String>> {
+    fn recurse(pattern: String, depth: usize, output: &mut Vec<String>) -> Option<()> {
+        if depth > 10 || output.len() >= 256 {
+            return None;
+        }
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut escaped = false;
+        let mut in_class = false;
+        let mut open = None;
+        for (i, ch) in chars.iter().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '[' => in_class = true,
+                ']' => in_class = false,
+                '{' if !in_class => {
+                    open = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            output.push(pattern);
+            return Some(());
+        };
+
+        let mut level = 1;
+        let mut escaped = false;
+        let mut in_class = false;
+        let mut commas = Vec::new();
+        let mut close = None;
+        for (i, ch) in chars.iter().copied().enumerate().skip(open + 1) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '[' => in_class = true,
+                ']' => in_class = false,
+                '{' if !in_class => level += 1,
+                '}' if !in_class => {
+                    level -= 1;
+                    if level == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                ',' if !in_class && level == 1 => commas.push(i),
+                _ => {}
+            }
+        }
+        let close = close?;
+        commas.push(close);
+
+        let prefix: String = chars[..open].iter().collect();
+        let suffix: String = chars[close + 1..].iter().collect();
+        let mut option_start = open + 1;
+        for option_end in commas {
+            let option: String = chars[option_start..option_end].iter().collect();
+            recurse(format!("{prefix}{option}{suffix}"), depth + 1, output)?;
+            option_start = option_end + 1;
+        }
+        Some(())
+    }
+
+    let mut output = Vec::new();
+    recurse(pattern.to_owned(), 0, &mut output)?;
+    Some(output)
+}
+
+fn tokenize_glob(pattern: &str) -> Option<Vec<GlobToken>> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut tokens = Vec::new();
+    let mut literal = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 1;
+                literal.push(*chars.get(i)?);
+                i += 1;
+            }
+            '/' => {
+                push_literal(&mut tokens, &mut literal);
+                tokens.push(GlobToken::Separator);
+                i += 1;
+            }
+            '?' => {
+                push_literal(&mut tokens, &mut literal);
+                tokens.push(GlobToken::Any);
+                i += 1;
+            }
+            '*' => {
+                push_literal(&mut tokens, &mut literal);
+                let start = i;
+                while i < chars.len() && chars[i] == '*' {
+                    i += 1;
+                }
+                let is_component = i - start >= 2
+                    && (start == 0 || chars[start - 1] == '/')
+                    && (i == chars.len() || chars[i] == '/');
+                if is_component && i < chars.len() {
+                    // Consume the following slash. The whole `**/` segment is
+                    // optional, as in the upstream glob matcher.
+                    tokens.push(GlobToken::GlobStarDirectory);
+                    i += 1;
+                } else if is_component {
+                    tokens.push(GlobToken::GlobStar);
+                } else {
+                    tokens.push(GlobToken::Star);
+                }
+            }
+            '[' => {
+                push_literal(&mut tokens, &mut literal);
+                let (token, next) = parse_class(&chars, i)?;
+                tokens.push(token);
+                i = next;
+            }
+            c => {
+                literal.push(c);
+                i += 1;
+            }
+        }
+    }
+    push_literal(&mut tokens, &mut literal);
+    Some(tokens)
+}
+
+fn push_literal(tokens: &mut Vec<GlobToken>, literal: &mut String) {
+    if !literal.is_empty() {
+        tokens.push(GlobToken::Literal(fold_for_glob(literal)));
+        literal.clear();
+    }
+}
+
+fn parse_class(chars: &[char], start: usize) -> Option<(GlobToken, usize)> {
+    let mut i = start + 1;
+    let negated = matches!(chars.get(i), Some('!') | Some('^'));
+    if negated {
         i += 1;
     }
 
+    let mut members = Vec::new();
     let mut first = true;
-    let mut escaped = false;
-    while i < bytes.len() {
-        if escaped {
-            escaped = false;
-            first = false;
-        } else if bytes[i] == b'\\' {
-            escaped = true;
-        } else if bytes[i] == b']' && !first {
-            return Some(i);
+    while i < chars.len() && (first || chars[i] != ']') {
+        let (low, next) = class_char(chars, i)?;
+        i = next;
+        let high = if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] != ']' {
+            let (high, next) = class_char(chars, i + 1)?;
+            i = next;
+            high
         } else {
-            first = false;
+            low
+        };
+        members.push((low, high));
+        first = false;
+    }
+    if i >= chars.len() || members.is_empty() {
+        return None;
+    }
+    Some((
+        GlobToken::Class {
+            negated,
+            ranges: members,
+        },
+        i + 1,
+    ))
+}
+
+fn class_char(chars: &[char], i: usize) -> Option<(char, usize)> {
+    if chars.get(i) == Some(&'\\') {
+        Some((*chars.get(i + 1)?, i + 2))
+    } else {
+        Some((*chars.get(i)?, i + 1))
+    }
+}
+
+fn name_units(name: &str) -> Vec<NameUnit> {
+    name.nfd()
+        .map(|ch| {
+            let text = ch.to_string();
+            NameUnit {
+                folded: fold_for_glob(&text),
+                separator: text == "/",
+                text,
+            }
+        })
+        .collect()
+}
+
+fn match_tokens(tokens: &[GlobToken], units: &[NameUnit]) -> bool {
+    let mut next = vec![false; units.len() + 1];
+    next[units.len()] = true;
+
+    for token in tokens.iter().rev() {
+        let mut current = vec![false; units.len() + 1];
+        match token {
+            GlobToken::Literal(expected) => {
+                for unit_index in (0..units.len()).rev() {
+                    current[unit_index] =
+                        consume_literal(expected, units, unit_index).is_some_and(|end| next[end]);
+                }
+            }
+            GlobToken::Separator => {
+                for unit_index in (0..units.len()).rev() {
+                    current[unit_index] = units[unit_index].separator && next[unit_index + 1];
+                }
+            }
+            GlobToken::Any => {
+                for unit_index in (0..units.len()).rev() {
+                    current[unit_index] =
+                        !units[unit_index].separator && next[next_cluster(units, unit_index)];
+                }
+            }
+            GlobToken::Class { negated, ranges } => {
+                for unit_index in (0..units.len()).rev() {
+                    current[unit_index] = class_match_end(*negated, ranges, units, unit_index)
+                        .is_some_and(|end| next[end]);
+                }
+            }
+            GlobToken::Star => {
+                current[units.len()] = next[units.len()];
+                for unit_index in (0..units.len()).rev() {
+                    current[unit_index] =
+                        next[unit_index] || !units[unit_index].separator && current[unit_index + 1];
+                }
+            }
+            GlobToken::GlobStar => {
+                current[units.len()] = next[units.len()];
+                for unit_index in (0..units.len()).rev() {
+                    current[unit_index] = next[unit_index] || current[unit_index + 1];
+                }
+            }
+            GlobToken::GlobStarDirectory => {
+                let mut later_separator_matches = false;
+                current[units.len()] = next[units.len()];
+                for unit_index in (0..units.len()).rev() {
+                    if units[unit_index].separator && next[unit_index + 1] {
+                        later_separator_matches = true;
+                    }
+                    current[unit_index] = next[unit_index] || later_separator_matches;
+                }
+            }
         }
-        i += 1;
+        next = current;
+    }
+    next[0]
+}
+
+fn consume_literal(expected: &str, units: &[NameUnit], start: usize) -> Option<usize> {
+    let mut actual = String::new();
+    for (offset, unit) in units[start..].iter().enumerate() {
+        if unit.separator {
+            return None;
+        }
+        actual.push_str(&unit.folded);
+        if actual == expected {
+            return Some(start + offset + 1);
+        }
+        if !expected.starts_with(&actual) {
+            return None;
+        }
     }
     None
+}
+
+fn next_cluster(units: &[NameUnit], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < units.len()
+        && !units[end].separator
+        && units[end]
+            .text
+            .chars()
+            .next()
+            .is_some_and(|ch| canonical_combining_class(ch) != 0)
+    {
+        end += 1;
+    }
+    end
+}
+
+fn class_match_end(
+    negated: bool,
+    ranges: &[(char, char)],
+    units: &[NameUnit],
+    start: usize,
+) -> Option<usize> {
+    if units.get(start)?.separator {
+        return None;
+    }
+    let end = next_cluster(units, start);
+    let text: String = units[start..end]
+        .iter()
+        .map(|unit| unit.text.as_str())
+        .collect();
+    equivalent_class_chars(&text)
+        .into_iter()
+        .any(|candidate| {
+            let contained = ranges
+                .iter()
+                .any(|(low, high)| *low <= candidate && candidate <= *high);
+            contained != negated
+        })
+        .then_some(end)
+}
+
+fn equivalent_class_chars(text: &str) -> Vec<char> {
+    let composed: String = text.nfc().collect();
+    let variants = [
+        composed.clone(),
+        composed.to_lowercase(),
+        composed.to_uppercase(),
+        composed.nfd().case_fold().nfc().collect(),
+    ];
+    let mut result = Vec::new();
+    for variant in variants {
+        let mut chars = variant.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            if !result.contains(&ch) {
+                result.push(ch);
+            }
+        }
+    }
+    result
 }
 
 /// Why a single path component can't be extracted portably, if it can't.
@@ -162,7 +451,14 @@ mod tests {
         assert!(glob_matches_folded("[A-z].txt", "_.TXT"));
         assert!(glob_matches_folded("[A].txt", "a.TXT"));
         assert!(glob_matches_folded("[A-Z].dat", "q.DAT"));
-        assert!(!glob_matches_folded("[!A-Z].dat", "q.DAT"));
+        assert!(glob_matches_folded("[!A-Z].dat", "q.DAT"));
+        assert!(glob_matches_folded("[\u{c9}].txt", "\u{e9}.TXT"));
+        assert!(glob_matches_folded("[A-f].txt", "Z.TXT"));
+        assert!(glob_matches_folded("[A-].txt", "a.TXT"));
+        assert!(!glob_matches_folded("[A-].txt", "_.TXT"));
+        assert!(glob_matches_folded("*.{txt,md}", "README.MD"));
+        assert!(!glob_matches_folded("!readme.txt", "README.TXT"));
+        assert!(glob_matches_folded("!readme.txt", "other.txt"));
         assert!(!glob_matches_folded("**/.git/**", "x/git/config"));
     }
 
