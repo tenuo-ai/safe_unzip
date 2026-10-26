@@ -62,12 +62,12 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> bool {
     let Some(patterns) = expand_braces(pattern) else {
         return false;
     };
-    let units = name_units(name);
+    let unit_sets = [name_units(name), folded_name_units(name)];
     patterns.into_iter().any(|pattern| {
         let Some(tokens) = tokenize_glob(&pattern) else {
             return false;
         };
-        match_tokens(&tokens, &units)
+        unit_sets.iter().any(|units| match_tokens(&tokens, units))
     })
 }
 
@@ -267,6 +267,20 @@ fn name_units(name: &str) -> Vec<NameUnit> {
         .collect()
 }
 
+fn folded_name_units(name: &str) -> Vec<NameUnit> {
+    fold_for_glob(name)
+        .chars()
+        .map(|ch| {
+            let text = ch.to_string();
+            NameUnit {
+                folded: text.clone(),
+                separator: text == "/",
+                text,
+            }
+        })
+        .collect()
+}
+
 fn match_tokens(tokens: &[GlobToken], units: &[NameUnit]) -> bool {
     let mut next = vec![false; units.len() + 1];
     next[units.len()] = true;
@@ -287,14 +301,16 @@ fn match_tokens(tokens: &[GlobToken], units: &[NameUnit]) -> bool {
             }
             GlobToken::Any => {
                 for unit_index in (0..units.len()).rev() {
-                    current[unit_index] =
-                        !units[unit_index].separator && next[next_cluster(units, unit_index)];
+                    current[unit_index] = equivalent_character_ends(units, unit_index)
+                        .into_iter()
+                        .any(|end| next[end]);
                 }
             }
             GlobToken::Class { negated, ranges } => {
                 for unit_index in (0..units.len()).rev() {
-                    current[unit_index] = class_match_end(*negated, ranges, units, unit_index)
-                        .is_some_and(|end| next[end]);
+                    current[unit_index] = class_match_ends(*negated, ranges, units, unit_index)
+                        .into_iter()
+                        .any(|end| next[end]);
                 }
             }
             GlobToken::Star => {
@@ -343,44 +359,51 @@ fn consume_literal(expected: &str, units: &[NameUnit], start: usize) -> Option<u
     None
 }
 
-fn next_cluster(units: &[NameUnit], start: usize) -> usize {
-    let mut end = start + 1;
-    while end < units.len()
-        && !units[end].separator
-        && units[end]
-            .text
-            .chars()
-            .next()
-            .is_some_and(|ch| canonical_combining_class(ch) != 0)
-    {
-        end += 1;
+fn equivalent_character_ends(units: &[NameUnit], start: usize) -> Vec<usize> {
+    if units.get(start).is_none_or(|unit| unit.separator) {
+        return Vec::new();
     }
-    end
+    let mut text = String::new();
+    let mut ends = Vec::new();
+    for (offset, unit) in units[start..].iter().enumerate() {
+        if unit.separator {
+            break;
+        }
+        text.push_str(&unit.text);
+        let mut composed = text.nfc();
+        if composed.next().is_some() && composed.next().is_none() {
+            ends.push(start + offset + 1);
+        } else if offset > 0 && canonical_combining_class(unit.text.chars().next().unwrap()) == 0 {
+            // Canonical composition never joins across two already-complete
+            // starters. Hangul is the exception that reaches this point, and
+            // successful L/V/T compositions were recorded above.
+            break;
+        }
+    }
+    ends
 }
 
-fn class_match_end(
+fn class_match_ends(
     negated: bool,
     ranges: &[(char, char)],
     units: &[NameUnit],
     start: usize,
-) -> Option<usize> {
-    if units.get(start)?.separator {
-        return None;
-    }
-    let end = next_cluster(units, start);
-    let text: String = units[start..end]
-        .iter()
-        .map(|unit| unit.text.as_str())
-        .collect();
-    equivalent_class_chars(&text)
+) -> Vec<usize> {
+    equivalent_character_ends(units, start)
         .into_iter()
-        .any(|candidate| {
-            let contained = ranges
+        .filter(|end| {
+            let text: String = units[start..*end]
                 .iter()
-                .any(|(low, high)| *low <= candidate && candidate <= *high);
-            contained != negated
+                .map(|unit| unit.text.as_str())
+                .collect();
+            equivalent_class_chars(&text).into_iter().any(|candidate| {
+                let contained = ranges
+                    .iter()
+                    .any(|(low, high)| *low <= candidate && candidate <= *high);
+                contained != negated
+            })
         })
-        .then_some(end)
+        .collect()
 }
 
 fn equivalent_class_chars(text: &str) -> Vec<char> {
@@ -459,6 +482,14 @@ mod tests {
         assert!(glob_matches_folded("*.{txt,md}", "README.MD"));
         assert!(!glob_matches_folded("!readme.txt", "README.TXT"));
         assert!(glob_matches_folded("!readme.txt", "other.txt"));
+        assert!(glob_matches_folded("??.txt", "\u{e9}.TXT"));
+        assert!(glob_matches_folded("stras*.txt", "stra\u{df}e.TXT"));
+        assert!(glob_matches_folded("?.txt", "\u{ac00}.TXT"));
+        assert!(glob_matches_folded("?.txt", "\u{1100}\u{1161}.TXT"));
+        assert!(glob_matches_folded(
+            "[\u{ac00}].txt",
+            "\u{1100}\u{1161}.TXT"
+        ));
         assert!(!glob_matches_folded("**/.git/**", "x/git/config"));
     }
 
