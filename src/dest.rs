@@ -32,7 +32,7 @@ pub(crate) struct Destination {
 }
 
 enum Backend {
-    Plain,
+    Plain(path_jail::Jail),
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -61,7 +61,7 @@ impl Destination {
 
         Ok(Self {
             root: root.to_path_buf(),
-            backend: Backend::Plain,
+            backend: Backend::Plain(path_jail::Jail::new(root)?),
         })
     }
 
@@ -73,7 +73,7 @@ impl Destination {
     /// Create `rel` and any missing parent directories.
     pub(crate) fn create_dir_all(&self, rel: &Path) -> Result<(), Error> {
         match &self.backend {
-            Backend::Plain => Ok(fs::create_dir_all(self.root.join(rel))?),
+            Backend::Plain(jail) => Ok(fs::create_dir_all(jail.join(rel)?)?),
             #[cfg(all(
                 target_os = "linux",
                 any(target_arch = "x86_64", target_arch = "aarch64")
@@ -87,15 +87,21 @@ impl Destination {
                         Err(path_jail::JailError::Io(e))
                             if e.kind() == io::ErrorKind::AlreadyExists =>
                         {
-                            let opened = jail
-                                .open(&prefix, path_jail::guard::OpenOptions::new().read(true))
-                                .map_err(|e| self.jail_error(&prefix, e))?;
-                            if !matches!(opened.file_kind(), path_jail::guard::FileKind::Directory)
-                            {
-                                return Err(Error::Io(io::Error::new(
-                                    io::ErrorKind::AlreadyExists,
-                                    format!("'{}' is not a directory", prefix.display()),
-                                )));
+                            // Resolve `prefix` as the parent of a probe entry.
+                            // FdJail's parent resolution uses
+                            // O_PATH | O_DIRECTORY, so this neither blocks on
+                            // FIFOs nor requires read permission. A created
+                            // probe is removed immediately; AlreadyExists also
+                            // proves the parent was opened as a directory.
+                            let probe = prefix.join(".__safe_unzip_directory_probe__");
+                            match jail.create_dir(&probe) {
+                                Err(path_jail::JailError::Io(e))
+                                    if e.kind() == io::ErrorKind::AlreadyExists => {}
+                                Err(e) => return Err(self.jail_error(&prefix, e)),
+                                Ok(()) => {
+                                    jail.remove_dir(&probe)
+                                        .map_err(|e| self.jail_error(&probe, e))?;
+                                }
                             }
                         }
                         Err(e) => return Err(self.jail_error(&prefix, e)),
@@ -137,8 +143,8 @@ impl Destination {
     /// Remove the file or symlink `rel` (never follows a final symlink).
     pub(crate) fn remove_file(&self, rel: &Path) -> io::Result<()> {
         match &self.backend {
-            Backend::Plain => {
-                let path = self.root.join(rel);
+            Backend::Plain(jail) => {
+                let path = plain_leaf_path(jail, rel)?;
                 // Only remove non-directories, like unlink(2).
                 match fs::symlink_metadata(&path) {
                     Ok(m) if m.is_dir() => Err(io::Error::new(
@@ -164,10 +170,10 @@ impl Destination {
     /// symlink).
     fn create_new(&self, rel: &Path) -> Result<File, Error> {
         match &self.backend {
-            Backend::Plain => Ok(fs::OpenOptions::new()
+            Backend::Plain(jail) => Ok(fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(self.root.join(rel))?),
+                .open(plain_leaf_path(jail, rel)?)?),
             #[cfg(all(
                 target_os = "linux",
                 any(target_arch = "x86_64", target_arch = "aarch64")
@@ -195,6 +201,17 @@ impl Destination {
             other => Error::Jail(other),
         }
     }
+}
+
+/// Resolve a file's parent through the path jail, but keep the final name
+/// unresolved so callers can safely replace a symlink rather than its target.
+fn plain_leaf_path(jail: &path_jail::Jail, rel: &Path) -> io::Result<PathBuf> {
+    let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+    let parent = jail.join(parent).map_err(io::Error::other)?;
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no final component")
+    })?;
+    Ok(parent.join(name))
 }
 
 /// An archive entry name as a path relative to the destination.
@@ -270,6 +287,68 @@ mod tests {
         assert!(!tmp.path().join("occupied/child").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn plain_backend_revalidates_normalized_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("safe/deeper")).unwrap();
+        fs::create_dir_all(tmp.path().join("safe/pivot")).unwrap();
+        symlink("safe/deeper", tmp.path().join("a")).unwrap();
+        symlink(outside.path(), tmp.path().join("pivot")).unwrap();
+
+        // The original spelling resolves to safe/pivot, but lexical
+        // normalization produces pivot, which points outside the jail.
+        let jail = path_jail::Jail::new(tmp.path()).unwrap();
+        assert!(jail.join("a/../pivot/payload.txt").is_ok());
+        let dest = Destination {
+            root: tmp.path().to_path_buf(),
+            backend: Backend::Plain(jail),
+        };
+        let rel = relative("a/../pivot/payload.txt");
+        assert!(dest.create_file(&rel, IfExists::Error).is_err());
+        assert!(!outside.path().join("payload.txt").exists());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn guarded_existing_directory_probe_is_nonblocking_and_metadata_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let jail = match path_jail::guard::FdJail::new(tmp.path()) {
+            Ok(jail) => jail,
+            Err(path_jail::JailError::UnsupportedKernel { .. }) => return,
+            Err(e) => panic!("unexpected FdJail initialization error: {e}"),
+        };
+        let dest = Destination {
+            root: tmp.path().to_path_buf(),
+            backend: Backend::Guarded(jail),
+        };
+
+        // A FIFO must be rejected without waiting for a writer.
+        let fifo = tmp.path().join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(dest.create_dir_all(Path::new("fifo/child")).is_err());
+
+        // O_PATH directory resolution needs search, not read, permission.
+        let write_only = tmp.path().join("write-only");
+        fs::create_dir(&write_only).unwrap();
+        fs::set_permissions(&write_only, fs::Permissions::from_mode(0o333)).unwrap();
+        let result = dest.create_dir_all(Path::new("write-only"));
+        fs::set_permissions(&write_only, fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+    }
+
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -295,7 +374,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let dest = Destination::new(tmp.path()).unwrap();
-        if matches!(dest.backend, Backend::Plain) {
+        if matches!(dest.backend, Backend::Plain(_)) {
             return;
         }
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("sub")).unwrap();
