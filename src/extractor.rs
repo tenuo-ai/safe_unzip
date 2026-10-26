@@ -200,7 +200,7 @@ impl Extractor {
 
         let jail = Jail::new(destination)?;
         Ok(Self {
-            dest: Destination::new(destination),
+            dest: Destination::new(destination)?,
             jail,
             limits: Limits::default(),
             overwrite: OverwritePolicy::default(),

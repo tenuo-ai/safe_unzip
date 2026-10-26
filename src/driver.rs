@@ -129,7 +129,7 @@ impl Driver {
         let jail = Jail::new(destination)?;
         Ok(Self {
             destination: destination.to_path_buf(),
-            dest: Destination::new(destination),
+            dest: Destination::new(destination)?,
             jail,
             limits: Limits::default(),
             overwrite: OverwriteMode::default(),

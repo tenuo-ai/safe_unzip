@@ -43,22 +43,26 @@ enum Backend {
 impl Destination {
     /// Open the destination. Uses the handle-relative backend when the
     /// platform and kernel support it, and plain paths otherwise.
-    pub(crate) fn new(root: &Path) -> Self {
+    pub(crate) fn new(root: &Path) -> Result<Self, Error> {
         #[cfg(all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
-        if let Ok(jail) = path_jail::guard::FdJail::new(root) {
-            return Self {
-                root: root.to_path_buf(),
-                backend: Backend::Guarded(jail),
-            };
+        match path_jail::guard::FdJail::new(root) {
+            Ok(jail) => {
+                return Ok(Self {
+                    root: root.to_path_buf(),
+                    backend: Backend::Guarded(jail),
+                });
+            }
+            Err(path_jail::JailError::UnsupportedKernel { .. }) => {}
+            Err(e) => return Err(Error::Jail(e)),
         }
 
-        Self {
+        Ok(Self {
             root: root.to_path_buf(),
             backend: Backend::Plain,
-        }
+        })
     }
 
     /// Absolute path of `rel`, for error messages.
@@ -81,7 +85,19 @@ impl Destination {
                     match jail.create_dir(&prefix) {
                         Ok(()) => {}
                         Err(path_jail::JailError::Io(e))
-                            if e.kind() == io::ErrorKind::AlreadyExists => {}
+                            if e.kind() == io::ErrorKind::AlreadyExists =>
+                        {
+                            let opened = jail
+                                .open(&prefix, path_jail::guard::OpenOptions::new().read(true))
+                                .map_err(|e| self.jail_error(&prefix, e))?;
+                            if !matches!(opened.file_kind(), path_jail::guard::FileKind::Directory)
+                            {
+                                return Err(Error::Io(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    format!("'{}' is not a directory", prefix.display()),
+                                )));
+                            }
+                        }
                         Err(e) => return Err(self.jail_error(&prefix, e)),
                     }
                 }
@@ -224,7 +240,7 @@ mod tests {
     #[test]
     fn create_and_replace() {
         let tmp = tempfile::tempdir().unwrap();
-        let dest = Destination::new(tmp.path());
+        let dest = Destination::new(tmp.path()).unwrap();
 
         dest.create_dir_all(Path::new("a/b")).unwrap();
         dest.create_dir_all(Path::new("a/b")).unwrap(); // idempotent
@@ -244,15 +260,30 @@ mod tests {
         assert!(dest.remove_file(Path::new("a")).is_err()); // directory
     }
 
+    #[test]
+    fn create_dir_all_rejects_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("occupied"), b"not a directory").unwrap();
+        let dest = Destination::new(tmp.path()).unwrap();
+
+        assert!(dest.create_dir_all(Path::new("occupied/child")).is_err());
+        assert!(!tmp.path().join("occupied/child").exists());
+    }
+
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[test]
-    fn linux_uses_handle_backend() {
+    fn linux_selects_backend_from_runtime_support() {
         let tmp = tempfile::tempdir().unwrap();
-        let dest = Destination::new(tmp.path());
-        assert!(matches!(dest.backend, Backend::Guarded(_)));
+        let supported = match path_jail::guard::FdJail::new(tmp.path()) {
+            Ok(_) => true,
+            Err(path_jail::JailError::UnsupportedKernel { .. }) => false,
+            Err(e) => panic!("unexpected FdJail initialization error: {e}"),
+        };
+        let dest = Destination::new(tmp.path()).unwrap();
+        assert_eq!(matches!(dest.backend, Backend::Guarded(_)), supported);
     }
 
     #[cfg(all(
@@ -263,7 +294,10 @@ mod tests {
     fn linux_writes_stay_beneath_destination() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let dest = Destination::new(tmp.path());
+        let dest = Destination::new(tmp.path()).unwrap();
+        if matches!(dest.backend, Backend::Plain) {
+            return;
+        }
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("sub")).unwrap();
 
         assert!(dest.create_dir_all(Path::new("sub/dir")).is_err());
@@ -282,7 +316,7 @@ mod tests {
         fs::write(&target, b"keep").unwrap();
         std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
 
-        let dest = Destination::new(tmp.path());
+        let dest = Destination::new(tmp.path()).unwrap();
         dest.create_file(Path::new("link"), IfExists::Replace)
             .unwrap()
             .unwrap();
