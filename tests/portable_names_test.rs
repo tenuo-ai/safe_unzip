@@ -25,7 +25,7 @@ fn files_under(dir: &Path) -> Vec<String> {
                 .strip_prefix(dir)
                 .unwrap()
                 .to_string_lossy()
-                .into_owned(),
+                .replace('\\', "/"),
         );
     }
     out.sort();
@@ -52,10 +52,18 @@ fn variant_zip() -> Vec<u8> {
         (".GIT/hooks/post-checkout", b"b"),
         ("Build/Tool.EXE", b"c"),
         ("cafe\u{301}/notes.txt", b"d"),
+        ("caf\u{e9}.TXT", b"e"),
+        ("_.TXT", b"f"),
     ])
 }
 
-const EXCLUDES: [&str; 3] = ["**/.git/**", "**/*.exe", "caf\u{e9}/**"];
+const EXCLUDES: [&str; 5] = [
+    "**/.git/**",
+    "**/*.exe",
+    "caf\u{e9}/**",
+    "cafe*.txt",
+    "[A-z].txt",
+];
 
 #[test]
 fn extractor_exclude_matches_equivalent_names() {
