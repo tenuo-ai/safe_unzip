@@ -253,6 +253,50 @@ fn folded_starter_before_a_wildcard_is_excluded_by_both_apis() {
 }
 
 #[test]
+fn unrelated_iotas_do_not_exhaust_spelling_budget() {
+    let name = format!("{}.txt", "\u{3b9}".repeat(9));
+    let zip = make_zip(&[(&name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&["*.exe"])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&["*.exe"])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
+fn invalid_iota_subscript_spelling_does_not_exclude() {
+    let name = "\u{3b1}\u{3af}.TXT";
+    let zip = make_zip(&[(name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&["\u{3ac}*\u{3b9}.txt"])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&["\u{3ac}*\u{3b9}.txt"])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
 fn branching_pending_probe_does_not_exclude_a_nonmatch() {
     let pattern = "\u{3b1}\u{345}*.txt";
     let name = format!("\u{3b1}{}.TXT", "a\u{301}\u{327}".repeat(16));

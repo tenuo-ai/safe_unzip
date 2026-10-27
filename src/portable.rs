@@ -140,7 +140,7 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
     if literal_only(&tokens) {
         return EquivalentMatch::NoMatch;
     }
-    let Some(graphs) = canonical_name_graphs(name) else {
+    let Some(graphs) = canonical_name_graphs(name, &tokens) else {
         return EquivalentMatch::Indeterminate;
     };
     let mut indeterminate = false;
@@ -394,8 +394,11 @@ fn canonical_name_graph(name: &str) -> Option<NameGraph> {
     Some(graph)
 }
 
-fn canonical_name_graphs(name: &str) -> Option<Vec<NameGraph>> {
+fn canonical_name_graphs(name: &str, tokens: &[GlobToken]) -> Option<Vec<NameGraph>> {
     let original = canonical_name_graph(name)?;
+    if !tokens_need_iota_spellings(tokens) {
+        return Some(vec![original]);
+    }
     let mut total_edges = original.edge_count;
     let mut graphs = vec![original];
     let folded: Vec<char> = fold_for_glob(name).chars().collect();
@@ -416,6 +419,9 @@ fn canonical_name_graphs(name: &str) -> Option<Vec<NameGraph>> {
             }
         }
         let spelling: String = spelling.into_iter().collect();
+        if fold_for_glob(&spelling).chars().ne(folded.iter().copied()) {
+            continue;
+        }
         let graph = canonical_name_graph(&spelling)?;
         total_edges = total_edges.checked_add(graph.edge_count)?;
         if total_edges > MAX_NAME_GRAPH_ITEMS {
@@ -424,6 +430,23 @@ fn canonical_name_graphs(name: &str) -> Option<Vec<NameGraph>> {
         graphs.push(graph);
     }
     Some(graphs)
+}
+
+fn tokens_need_iota_spellings(tokens: &[GlobToken]) -> bool {
+    tokens.iter().any(|token| match token {
+        GlobToken::Literal(literal) => literal.chars().any(char_decomposes_to_iota_subscript),
+        GlobToken::Class { ranges, .. } => ranges
+            .iter()
+            .any(|(low, high)| (*low..=*high).any(char_decomposes_to_iota_subscript)),
+        GlobToken::Alternatives(alternatives) => alternatives
+            .iter()
+            .any(|alternative| tokens_need_iota_spellings(alternative)),
+        GlobToken::Separator | GlobToken::Any | GlobToken::Star | GlobToken::DoubleStar => false,
+    })
+}
+
+fn char_decomposes_to_iota_subscript(ch: char) -> bool {
+    ch.to_string().nfd().any(|part| part == '\u{345}')
 }
 
 fn pre_fold_clusters(name: &str) -> Option<Vec<Vec<PreFoldUnit>>> {
