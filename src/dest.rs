@@ -316,7 +316,7 @@ mod tests {
         // not open the directory for reading or attempt a write probe.
         let read_only = tmp.path().join("read-only");
         fs::create_dir_all(read_only.join("writable")).unwrap();
-        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o111)).unwrap();
         let existing_result = dest.create_dir_all(Path::new("read-only"));
         let child_result = dest.create_dir_all(Path::new("read-only/writable/created"));
         fs::set_permissions(&read_only, fs::Permissions::from_mode(0o755)).unwrap();

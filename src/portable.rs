@@ -114,6 +114,13 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
     let Some(tokens) = tokenize_glob(pattern) else {
         return EquivalentMatch::NoMatch;
     };
+    if let Some(literal) = literal_pattern(&tokens) {
+        return if fold_for_glob(&literal) == fold_for_glob(name) {
+            EquivalentMatch::Match
+        } else {
+            EquivalentMatch::NoMatch
+        };
+    }
     let Some(graph) = canonical_name_graph(name) else {
         return EquivalentMatch::Indeterminate;
     };
@@ -122,6 +129,18 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
         Some(false) => EquivalentMatch::NoMatch,
         None => EquivalentMatch::Indeterminate,
     }
+}
+
+fn literal_pattern(tokens: &[GlobToken]) -> Option<String> {
+    let mut literal = String::new();
+    for token in tokens {
+        match token {
+            GlobToken::Literal(fragment) => literal.push_str(fragment),
+            GlobToken::Separator => literal.push('/'),
+            _ => return None,
+        }
+    }
+    Some(literal)
 }
 
 fn tokenize_glob(pattern: &str) -> Option<Vec<GlobToken>> {
@@ -1011,6 +1030,10 @@ mod tests {
         assert!(glob_matches_folded("**/*.exe", "bin/Tool.EXE"));
         assert!(glob_matches_folded("**/caf\u{e9}/**", "cafe\u{301}/a"));
         assert!(glob_matches_folded("cafe*.txt", "caf\u{e9}.TXT"));
+        assert!(!glob_matches_folded(
+            "\u{3b1}\u{3af}.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
         assert!(glob_matches_folded("[A-z].txt", "_.TXT"));
         assert!(glob_matches_folded("[A].txt", "a.TXT"));
         assert!(glob_matches_folded("[A-Z].dat", "q.DAT"));

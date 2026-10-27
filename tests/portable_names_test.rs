@@ -286,6 +286,29 @@ fn duplicate_braces_do_not_exclude_a_nonmatch() {
 }
 
 #[test]
+fn distinct_literal_canonical_fold_is_not_excluded() {
+    let pattern = "\u{3b1}\u{3af}.txt";
+    let name = "\u{3b1}\u{345}\u{301}.TXT";
+    let zip = make_zip(&[(name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
 fn include_and_only_stay_exact() {
     let zip = make_zip(&[("README.md", b"a"), ("readme.md", b"b")]);
     let dest = tempdir().unwrap();
