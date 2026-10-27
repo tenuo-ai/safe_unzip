@@ -242,6 +242,50 @@ fn combining_mark_braces_do_not_exclude_a_nonmatch() {
 }
 
 #[test]
+fn interleaved_prefold_composition_is_excluded_by_both_apis() {
+    let pattern = "[\u{130}]*.txt";
+    let zip = make_zip(&[("I\u{327}\u{307}.TXT", b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+}
+
+#[test]
+fn duplicate_braces_do_not_exclude_a_nonmatch() {
+    let pattern = format!("{{{}}}.txt", vec!["a"; 1_025].join(","));
+    let zip = make_zip(&[("another.rs", b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), ["another.rs"]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), ["another.rs"]);
+}
+
+#[test]
 fn include_and_only_stay_exact() {
     let zip = make_zip(&[("README.md", b"a"), ("readme.md", b"b")]);
     let dest = tempdir().unwrap();

@@ -578,12 +578,10 @@ fn advance_sequence(
                 for state in states {
                     for alternative in alternatives {
                         branches.extend(advance_sequence(alternative, vec![state.clone()], graph)?);
-                        if branches.len() > MAX_MATCH_STATES {
-                            return None;
-                        }
+                        branches = merge_states(branches)?;
                     }
                 }
-                merge_states(branches)?
+                branches
             }
             _ => advance_nonstar(token, states, graph)?,
         };
@@ -937,12 +935,6 @@ fn pre_fold_scalar(units: &[NameUnit], start: usize, end: usize) -> Option<char>
         return None;
     }
     pre_units.sort_by_key(|(pre_unit, _, _, _)| *pre_unit);
-    if pre_units
-        .windows(2)
-        .any(|pair| pair[0].0.checked_add(1) != Some(pair[1].0))
-    {
-        return None;
-    }
     let text: String = pre_units
         .into_iter()
         .map(|(_, pre_char, _, _)| pre_char)
@@ -1036,6 +1028,7 @@ mod tests {
         assert!(glob_matches_folded("[\u{df}].txt", "\u{1e9e}.TXT"));
         assert!(glob_matches_folded("?.txt", "I\u{307}.TXT"));
         assert!(glob_matches_folded("[\u{130}].txt", "I\u{307}.TXT"));
+        assert!(glob_matches_folded("[\u{130}]*.txt", "I\u{327}\u{307}.TXT"));
         assert!(glob_matches_folded("?.txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("[\u{fb03}].txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("?.txt", "\u{fb04}.TXT"));
@@ -1104,6 +1097,8 @@ mod tests {
         ));
         let combining_braces = format!("a{}.txt", "{\u{301},\u{300}}".repeat(20));
         assert!(!glob_matches_folded(&combining_braces, "unrelated.rs"));
+        let duplicate_braces = format!("{{{}}}.txt", vec!["a"; 1_025].join(","));
+        assert!(!glob_matches_folded(&duplicate_braces, "another.rs"));
     }
 
     #[test]
