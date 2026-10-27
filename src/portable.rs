@@ -9,6 +9,8 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
 
+use std::collections::HashSet;
+
 /// Case-folded, NFC-normalized form of `s`, for comparing names the way
 /// case-insensitive, normalization-insensitive filesystems do.
 pub(crate) fn fold(s: &str) -> String {
@@ -108,6 +110,7 @@ const MAX_CANONICAL_CLUSTER_VARIANTS: usize = 256;
 const MAX_COMBINING_MARKS_PER_CLUSTER: usize = 64;
 const MAX_NAME_GRAPH_ITEMS: usize = 65_536;
 const MAX_MATCH_STATES: usize = 1_024;
+const MAX_PENDING_PROBE_STATES: usize = 4_096;
 
 /// Match a glob against any case- or normalization-equivalent spelling of a
 /// name. This is deliberately token-aware: folding raw glob text can change a
@@ -899,26 +902,39 @@ fn pending_cluster_can_continue(state: &MatchState, graph: &NameGraph) -> bool {
 }
 
 fn cluster_path_contains_units(node: usize, required: &[(char, usize)], graph: &NameGraph) -> bool {
-    if required.iter().all(|(_, count)| *count == 0) {
-        return true;
-    }
-    for edge in &graph.edges[node] {
-        let mut remaining = required.to_vec();
-        if let Some((_, count)) = remaining
-            .iter_mut()
-            .find(|(candidate, count)| *candidate == edge.unit.ch && *count > 0)
-        {
-            *count -= 1;
-        }
-        let complete = remaining.iter().all(|(_, count)| *count == 0);
-        let has_folded_starter = remaining
-            .iter()
-            .any(|(ch, count)| *count > 0 && canonical_combining_class(*ch) == 0);
-        if complete
-            || ((!graph.cluster_boundaries[edge.target] || has_folded_starter)
-                && cluster_path_contains_units(edge.target, &remaining, graph))
-        {
-            return true;
+    let chars: Vec<char> = required.iter().map(|(ch, _)| *ch).collect();
+    let counts: Vec<usize> = required.iter().map(|(_, count)| *count).collect();
+    let mut stack = vec![(node, counts.clone())];
+    let mut seen = HashSet::from([(node, counts)]);
+    while let Some((node, counts)) = stack.pop() {
+        for edge in &graph.edges[node] {
+            let mut remaining = counts.clone();
+            if let Some(index) = chars.iter().enumerate().find_map(|(index, candidate)| {
+                (*candidate == edge.unit.ch && remaining[index] > 0).then_some(index)
+            }) {
+                remaining[index] -= 1;
+            }
+            if remaining.iter().all(|count| *count == 0) {
+                return true;
+            }
+            let has_folded_starter = chars
+                .iter()
+                .zip(&remaining)
+                .any(|(ch, count)| *count > 0 && canonical_combining_class(*ch) == 0);
+            if graph.cluster_boundaries[edge.target] && !has_folded_starter {
+                continue;
+            }
+            let next = (edge.target, remaining.clone());
+            if seen.contains(&next) {
+                continue;
+            }
+            if seen.len() == MAX_PENDING_PROBE_STATES {
+                // This probe is only an optimization. Keeping the state lets
+                // the bounded matcher decide safely without unbounded work.
+                return true;
+            }
+            seen.insert(next);
+            stack.push((edge.target, remaining));
         }
     }
     false
@@ -1499,6 +1515,16 @@ mod tests {
         assert!(!glob_matches_folded(&combining_braces, "unrelated.rs"));
         let unreachable_combining_braces = format!("a{}.txt", "{\u{301},\u{300}}".repeat(11));
         assert!(!glob_matches_folded(&unreachable_combining_braces, "a.txt"));
+        let long_pending_probe = format!("\u{3b1}{}.TXT", "a".repeat(60_000));
+        assert!(!glob_matches_folded(
+            "\u{3b1}\u{345}*.txt",
+            &long_pending_probe
+        ));
+        let branching_pending_probe = format!("\u{3b1}{}.TXT", "a\u{301}\u{327}".repeat(16));
+        assert!(!glob_matches_folded(
+            "\u{3b1}\u{345}*.txt",
+            &branching_pending_probe
+        ));
         let duplicate_braces = format!("{{{}}}.txt", vec!["a"; 1_025].join(","));
         assert!(!glob_matches_folded(&duplicate_braces, "another.rs"));
     }

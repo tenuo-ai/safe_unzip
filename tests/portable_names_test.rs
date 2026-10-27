@@ -243,6 +243,29 @@ fn folded_starter_before_a_wildcard_is_excluded_by_both_apis() {
 }
 
 #[test]
+fn branching_pending_probe_does_not_exclude_a_nonmatch() {
+    let pattern = "\u{3b1}\u{345}*.txt";
+    let name = format!("\u{3b1}{}.TXT", "a\u{301}\u{327}".repeat(16));
+    let zip = make_zip(&[(&name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
 fn combining_mark_braces_do_not_exclude_a_nonmatch() {
     let pattern = format!("a{}.txt", "{\u{301},\u{300}}".repeat(20));
     let zip = make_zip(&[("unrelated.rs", b"x")]);
