@@ -121,15 +121,19 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
             EquivalentMatch::NoMatch
         };
     }
-    let graph = if literal_only(&tokens) {
-        Some(linear_folded_name_graph(name))
-    } else {
-        canonical_name_graph(name)
-    };
-    let Some(graph) = graph else {
+    let linear = linear_folded_name_graph(name);
+    match match_tokens(&tokens, &linear, false) {
+        Some(true) => return EquivalentMatch::Match,
+        Some(false) => {}
+        None => return EquivalentMatch::Indeterminate,
+    }
+    if literal_only(&tokens) {
+        return EquivalentMatch::NoMatch;
+    }
+    let Some(graph) = canonical_name_graph(name) else {
         return EquivalentMatch::Indeterminate;
     };
-    match match_tokens(&tokens, &graph) {
+    match match_tokens(&tokens, &graph, true) {
         Some(true) => EquivalentMatch::Match,
         Some(false) => EquivalentMatch::NoMatch,
         None => EquivalentMatch::Indeterminate,
@@ -610,9 +614,10 @@ struct MatchState {
     component_start: bool,
     pending_stars: u8,
     pending_literal: String,
+    used_wildcard: bool,
 }
 
-fn match_tokens(tokens: &[GlobToken], graph: &NameGraph) -> Option<bool> {
+fn match_tokens(tokens: &[GlobToken], graph: &NameGraph, require_wildcard: bool) -> Option<bool> {
     let mut positions = vec![false; graph.edges.len()];
     positions[0] = true;
     let states = advance_sequence(
@@ -622,13 +627,14 @@ fn match_tokens(tokens: &[GlobToken], graph: &NameGraph) -> Option<bool> {
             component_start: true,
             pending_stars: 0,
             pending_literal: String::new(),
+            used_wildcard: false,
         }],
         graph,
     )?;
     Some(
         finish_states(states, graph)?
             .iter()
-            .any(|state| state.positions[graph.end]),
+            .any(|state| state.positions[graph.end] && (!require_wildcard || state.used_wildcard)),
     )
 }
 
@@ -649,6 +655,7 @@ fn advance_sequence(
                 let mut states = flush_pending_literals(states, graph)?;
                 for state in &mut states {
                     state.pending_stars = state.pending_stars.saturating_add(count).min(2);
+                    state.used_wildcard = true;
                 }
                 states
             }
@@ -675,6 +682,9 @@ fn advance_nonstar(
 ) -> Option<Vec<MatchState>> {
     let mut advanced = Vec::new();
     for mut state in flush_pending_literals(states, graph)? {
+        if matches!(token, GlobToken::Any | GlobToken::Class { .. }) {
+            state.used_wildcard = true;
+        }
         if state.pending_stars >= 2
             && state.component_start
             && matches!(token, GlobToken::Separator)
@@ -719,6 +729,7 @@ fn merge_states(states: Vec<MatchState>) -> Option<Vec<MatchState>> {
             existing.component_start == state.component_start
                 && existing.pending_stars == state.pending_stars
                 && existing.pending_literal == state.pending_literal
+                && existing.used_wildcard == state.used_wildcard
         }) {
             for (target, source) in existing.positions.iter_mut().zip(state.positions) {
                 *target |= source;
@@ -1096,6 +1107,10 @@ mod tests {
         ));
         assert!(!glob_matches_folded(
             "{\u{3b1}\u{3af},x}.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "{\u{3b1}\u{3af},x*}.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
         ));
         assert!(glob_matches_folded("[A-z].txt", "_.TXT"));
