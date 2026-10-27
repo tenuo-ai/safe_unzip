@@ -888,9 +888,12 @@ fn pending_cluster_can_continue(state: &MatchState, graph: &NameGraph) -> bool {
             required.push((ch, 1));
         }
     }
+    let has_folded_starter = required
+        .iter()
+        .any(|(ch, count)| *count > 0 && canonical_combining_class(*ch) == 0);
     state.positions.iter().enumerate().any(|(node, rank)| {
         *rank != UNREACHABLE
-            && (!graph.cluster_boundaries[node] || state.component_start)
+            && (!graph.cluster_boundaries[node] || state.component_start || has_folded_starter)
             && cluster_path_contains_units(node, &required, graph)
     })
 }
@@ -907,8 +910,12 @@ fn cluster_path_contains_units(node: usize, required: &[(char, usize)], graph: &
         {
             *count -= 1;
         }
-        if remaining.iter().all(|(_, count)| *count == 0)
-            || (!graph.cluster_boundaries[edge.target]
+        let complete = remaining.iter().all(|(_, count)| *count == 0);
+        let has_folded_starter = remaining
+            .iter()
+            .any(|(ch, count)| *count > 0 && canonical_combining_class(*ch) == 0);
+        if complete
+            || ((!graph.cluster_boundaries[edge.target] || has_folded_starter)
                 && cluster_path_contains_units(edge.target, &remaining, graph))
         {
             return true;
@@ -1415,6 +1422,10 @@ mod tests {
         assert!(glob_matches_folded(
             "\u{3b1}[\u{3b9}]\u{301}.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
+        ));
+        assert!(glob_matches_folded(
+            "\u{3b1}\u{345}*.txt",
+            "\u{3b1}\u{3b9}.TXT"
         ));
         assert!(glob_matches_folded("?.txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("[\u{fb03}].txt", "\u{fb03}.TXT"));
