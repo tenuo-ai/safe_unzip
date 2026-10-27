@@ -78,37 +78,9 @@ impl Destination {
                 target_os = "linux",
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
-            Backend::Guarded(jail) => {
-                let mut prefix = PathBuf::new();
-                for component in rel.components() {
-                    prefix.push(component);
-                    match jail.create_dir(&prefix) {
-                        Ok(()) => {}
-                        Err(path_jail::JailError::Io(e))
-                            if e.kind() == io::ErrorKind::AlreadyExists =>
-                        {
-                            // Resolve `prefix` as the parent of a probe entry.
-                            // FdJail's parent resolution uses
-                            // O_PATH | O_DIRECTORY, so this neither blocks on
-                            // FIFOs nor requires read permission. A created
-                            // probe is removed immediately; AlreadyExists also
-                            // proves the parent was opened as a directory.
-                            let probe = prefix.join(".__safe_unzip_directory_probe__");
-                            match jail.create_dir(&probe) {
-                                Err(path_jail::JailError::Io(e))
-                                    if e.kind() == io::ErrorKind::AlreadyExists => {}
-                                Err(e) => return Err(self.jail_error(&prefix, e)),
-                                Ok(()) => {
-                                    jail.remove_dir(&probe)
-                                        .map_err(|e| self.jail_error(&probe, e))?;
-                                }
-                            }
-                        }
-                        Err(e) => return Err(self.jail_error(&prefix, e)),
-                    }
-                }
-                Ok(())
-            }
+            Backend::Guarded(jail) => jail
+                .create_dir_all(rel)
+                .map_err(|e| self.jail_error(rel, e)),
         }
     }
 
@@ -317,7 +289,7 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[test]
-    fn guarded_existing_directory_probe_is_nonblocking_and_metadata_only() {
+    fn guarded_existing_directory_check_is_nonblocking_and_nonmutating() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -340,12 +312,13 @@ mod tests {
         assert!(status.success());
         assert!(dest.create_dir_all(Path::new("fifo/child")).is_err());
 
-        // O_PATH directory resolution needs search, not read, permission.
-        let write_only = tmp.path().join("write-only");
-        fs::create_dir(&write_only).unwrap();
-        fs::set_permissions(&write_only, fs::Permissions::from_mode(0o333)).unwrap();
-        let result = dest.create_dir_all(Path::new("write-only"));
-        fs::set_permissions(&write_only, fs::Permissions::from_mode(0o755)).unwrap();
+        // Checking an existing directory needs search permission only: it must
+        // not open the directory for reading or attempt a write probe.
+        let read_only = tmp.path().join("read-only");
+        fs::create_dir(&read_only).unwrap();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = dest.create_dir_all(Path::new("read-only"));
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o755)).unwrap();
         result.unwrap();
     }
 

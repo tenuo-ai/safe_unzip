@@ -11,7 +11,8 @@ All notable changes to this project will be documented in this file.
   write boundary, preventing `..` plus symlink aliases from redirecting a
   write outside the destination.
 - Existing-directory checks on the guarded backend no longer open entries for
-  reading, avoiding FIFO hangs and allowing directories without read access.
+  reading or probe them for writing, avoiding FIFO hangs and allowing
+  searchable directories without read or write access.
 - Portable exclusion matching now handles large brace expressions without
   Cartesian expansion and preserves wildcard boundaries across canonically
   reordered combining marks.

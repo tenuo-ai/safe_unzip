@@ -376,9 +376,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "path_jail"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90ffcdca91ae4938ba61a95df85ce23c14ae81f8a70f69ca94784e6ea320d8a8"
+checksum = "c469ad45f3d52c8e3721b67486e2509e799fdc5b7fcb7cae2e70f1dddd8aeb41"
 
 [[package]]
 name = "pin-project-lite"

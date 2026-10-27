@@ -21,7 +21,15 @@ pub(crate) fn fold(s: &str) -> String {
 pub(crate) fn glob_matches_folded(pattern: &str, name: &str) -> bool {
     let negations = pattern.chars().take_while(|ch| *ch == '!').count();
     let positive = &pattern[negations..];
-    let matched = glob_match::glob_match(positive, name) || equivalent_glob_match(positive, name);
+    let exact = glob_match::glob_match(positive, name);
+    let equivalent = equivalent_glob_match(positive, name);
+    if !exact && equivalent == EquivalentMatch::Indeterminate {
+        // Exclusions are a safety boundary. If a deliberately pathological
+        // pattern/name would exceed the bounded equivalence search, exclude it
+        // rather than allow a normalization variant to bypass the filter.
+        return true;
+    }
+    let matched = exact || equivalent == EquivalentMatch::Match;
     if negations % 2 == 1 {
         !matched
     } else {
@@ -30,15 +38,16 @@ pub(crate) fn glob_matches_folded(pattern: &str, name: &str) -> bool {
 }
 
 fn fold_for_glob(s: &str) -> String {
-    s.nfd().case_fold().collect()
+    s.nfd().case_fold().nfd().collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum GlobToken {
     Literal(String),
     Separator,
     Any,
     Star,
+    DoubleStar,
     GlobStar,
     GlobStarDirectory,
     Class {
@@ -50,26 +59,33 @@ enum GlobToken {
 
 #[derive(Debug)]
 struct NameUnit {
-    text: String,
-    folded: String,
+    ch: char,
     separator: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EquivalentMatch {
+    Match,
+    NoMatch,
+    Indeterminate,
+}
+
+const MAX_BRACE_EXPANSIONS: usize = 4_096;
+const MAX_CANONICAL_VARIANTS: usize = 256;
+const MAX_MATCH_ATTEMPTS: usize = 65_536;
 
 /// Match a glob against any case- or normalization-equivalent spelling of a
 /// name. This is deliberately token-aware: folding raw glob text can change a
 /// range (`[A-f]`), turn a literal hyphen into a range, or split one Unicode
 /// class member into several code points.
-fn equivalent_glob_match(pattern: &str, name: &str) -> bool {
+fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
     let Some(tokens) = tokenize_glob(pattern) else {
-        return false;
+        return EquivalentMatch::NoMatch;
     };
-    let unit_sets = [
-        name_units(name),
-        folded_name_units(name),
-        locally_decomposed_name_units(name),
-        pattern_ordered_name_units(name, &tokens),
-    ];
-    unit_sets.iter().any(|units| match_tokens(&tokens, units))
+    let Some(unit_sets) = canonical_name_variants(name) else {
+        return EquivalentMatch::Indeterminate;
+    };
+    match_expansions(&tokens, &unit_sets)
 }
 
 fn tokenize_glob(pattern: &str) -> Option<Vec<GlobToken>> {
@@ -117,16 +133,11 @@ fn tokenize_sequence(
                 while *i < chars.len() && chars[*i] == '*' {
                     *i += 1;
                 }
-                let is_component = *i - start >= 2
-                    && (start == 0 || chars[start - 1] == '/')
-                    && (*i == chars.len() || chars[*i] == '/');
-                if is_component && *i < chars.len() {
-                    // Consume the following slash. The whole `**/` segment is
-                    // optional, as in the upstream glob matcher.
-                    tokens.push(GlobToken::GlobStarDirectory);
-                    *i += 1;
-                } else if is_component {
-                    tokens.push(GlobToken::GlobStar);
+                if *i - start >= 2 {
+                    // Whether this is a whole-component globstar depends on
+                    // the selected brace branches. Classify it only after a
+                    // concrete branch has been chosen.
+                    tokens.push(GlobToken::DoubleStar);
                 } else {
                     tokens.push(GlobToken::Star);
                 }
@@ -213,123 +224,207 @@ fn class_char(chars: &[char], i: usize) -> Option<(char, usize)> {
     }
 }
 
-fn name_units(name: &str) -> Vec<NameUnit> {
-    name.nfd()
-        .map(|ch| {
-            let text = ch.to_string();
-            NameUnit {
-                folded: fold_for_glob(&text),
-                separator: text == "/",
-                text,
-            }
-        })
-        .collect()
-}
-
-fn folded_name_units(name: &str) -> Vec<NameUnit> {
-    fold_for_glob(name)
-        .chars()
-        .map(|ch| {
-            let text = ch.to_string();
-            NameUnit {
-                folded: text.clone(),
-                separator: text == "/",
-                text,
-            }
-        })
-        .collect()
-}
-
-/// Decompose each source scalar independently. Unlike whole-string NFD this
-/// preserves a wildcard boundary before a following combining mark, while
-/// still exposing the decomposed spelling of composed scalars.
-fn locally_decomposed_name_units(name: &str) -> Vec<NameUnit> {
-    name.chars()
-        .flat_map(|ch| ch.to_string().nfd().collect::<Vec<_>>())
-        .map(|ch| {
-            let text = ch.to_string();
-            NameUnit {
-                folded: fold_for_glob(&text),
-                separator: text == "/",
-                text,
-            }
-        })
-        .collect()
-}
-
-/// Put combining-mark groups required by literal tokens first within each
-/// canonical cluster. Marks with the same combining class retain their order,
-/// because swapping those would change the canonical-equivalence class.
-fn pattern_ordered_name_units(name: &str, tokens: &[GlobToken]) -> Vec<NameUnit> {
-    fn priorities(tokens: &[GlobToken], output: &mut Vec<char>) {
-        for token in tokens {
-            match token {
-                GlobToken::Literal(literal) => {
-                    for ch in literal.chars() {
-                        if canonical_combining_class(ch) != 0 && !output.contains(&ch) {
-                            output.push(ch);
-                        }
-                    }
-                }
-                GlobToken::Alternatives(alternatives) => {
-                    for alternative in alternatives {
-                        priorities(alternative, output);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn push_cluster(cluster: &mut Vec<char>, priority: &[char], output: &mut Vec<char>) {
-        if cluster.is_empty() {
-            return;
-        }
-        output.push(cluster[0]);
-        let mut groups: Vec<(u8, Vec<char>)> = Vec::new();
-        for ch in cluster.drain(1..) {
-            let class = canonical_combining_class(ch);
-            if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == class) {
-                group.push(ch);
-            } else {
-                groups.push((class, vec![ch]));
-            }
-        }
-        groups.sort_by_key(|(class, chars)| {
-            let requested = chars
-                .iter()
-                .filter_map(|ch| priority.iter().position(|wanted| wanted == ch))
-                .min()
-                .unwrap_or(usize::MAX);
-            (requested, *class)
-        });
-        output.extend(groups.into_iter().flat_map(|(_, chars)| chars));
-        cluster.clear();
-    }
-
-    let mut priority = Vec::new();
-    priorities(tokens, &mut priority);
-    let mut reordered = Vec::new();
-    let mut cluster = Vec::new();
+/// Enumerate the canonically equivalent orderings of the folded name.
+/// Combining marks with the same class retain their relative order, while
+/// marks from different classes may interleave. The bound keeps malicious
+/// names from causing combinatorial work.
+fn canonical_name_variants(name: &str) -> Option<Vec<Vec<NameUnit>>> {
+    let mut clusters: Vec<Vec<char>> = Vec::new();
     for ch in fold_for_glob(name).chars() {
-        if canonical_combining_class(ch) == 0 && !cluster.is_empty() {
-            push_cluster(&mut cluster, &priority, &mut reordered);
+        if canonical_combining_class(ch) == 0 || clusters.is_empty() {
+            clusters.push(Vec::new());
         }
-        cluster.push(ch);
+        clusters.last_mut().unwrap().push(ch);
     }
-    push_cluster(&mut cluster, &priority, &mut reordered);
 
-    reordered
-        .into_iter()
-        .map(|ch| {
-            let text = ch.to_string();
-            NameUnit {
-                folded: text.clone(),
-                separator: text == "/",
-                text,
+    let mut variants = vec![Vec::new()];
+    for cluster in clusters {
+        let cluster_variants = canonical_cluster_variants(&cluster)?;
+        if variants.len().checked_mul(cluster_variants.len())? > MAX_CANONICAL_VARIANTS {
+            return None;
+        }
+        let mut combined = Vec::with_capacity(variants.len() * cluster_variants.len());
+        for prefix in &variants {
+            for suffix in &cluster_variants {
+                let mut spelling = Vec::with_capacity(prefix.len() + suffix.len());
+                spelling.extend_from_slice(prefix);
+                spelling.extend_from_slice(suffix);
+                combined.push(spelling);
             }
-        })
-        .collect()
+        }
+        variants = combined;
+    }
+
+    Some(
+        variants
+            .into_iter()
+            .map(|variant| {
+                variant
+                    .into_iter()
+                    .map(|ch| NameUnit {
+                        ch,
+                        separator: ch == '/',
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+fn canonical_cluster_variants(cluster: &[char]) -> Option<Vec<Vec<char>>> {
+    if cluster.is_empty() {
+        return Some(vec![Vec::new()]);
+    }
+
+    let starter = (canonical_combining_class(cluster[0]) == 0).then_some(cluster[0]);
+    let marks = &cluster[usize::from(starter.is_some())..];
+    let mut groups: Vec<(u8, Vec<char>)> = Vec::new();
+    for &mark in marks {
+        let class = canonical_combining_class(mark);
+        if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == class) {
+            group.push(mark);
+        } else {
+            groups.push((class, vec![mark]));
+        }
+    }
+
+    let mut positions = vec![0; groups.len()];
+    let mut suffix = Vec::with_capacity(marks.len());
+    let mut results = Vec::new();
+    interleave_combining_groups(&groups, &mut positions, &mut suffix, &mut results)?;
+    if let Some(starter) = starter {
+        for result in &mut results {
+            result.insert(0, starter);
+        }
+    }
+    Some(results)
+}
+
+fn interleave_combining_groups(
+    groups: &[(u8, Vec<char>)],
+    positions: &mut [usize],
+    current: &mut Vec<char>,
+    results: &mut Vec<Vec<char>>,
+) -> Option<()> {
+    if positions
+        .iter()
+        .zip(groups)
+        .all(|(position, (_, group))| *position == group.len())
+    {
+        if results.len() == MAX_CANONICAL_VARIANTS {
+            return None;
+        }
+        results.push(current.clone());
+        return Some(());
+    }
+
+    for group_index in 0..groups.len() {
+        let position = positions[group_index];
+        if position < groups[group_index].1.len() {
+            current.push(groups[group_index].1[position]);
+            positions[group_index] += 1;
+            interleave_combining_groups(groups, positions, current, results)?;
+            positions[group_index] -= 1;
+            current.pop();
+        }
+    }
+    Some(())
+}
+
+fn match_expansions(tokens: &[GlobToken], unit_sets: &[Vec<NameUnit>]) -> EquivalentMatch {
+    let mut current = Vec::new();
+    let mut expansions = 0;
+    let mut attempts = 0;
+    walk_expansions(
+        vec![(tokens, 0)],
+        &mut current,
+        unit_sets,
+        &mut expansions,
+        &mut attempts,
+    )
+}
+
+fn walk_expansions(
+    mut stack: Vec<(&[GlobToken], usize)>,
+    current: &mut Vec<GlobToken>,
+    unit_sets: &[Vec<NameUnit>],
+    expansions: &mut usize,
+    attempts: &mut usize,
+) -> EquivalentMatch {
+    while stack
+        .last()
+        .is_some_and(|(sequence, index)| *index == sequence.len())
+    {
+        stack.pop();
+    }
+
+    let Some((sequence, index)) = stack.last().copied() else {
+        if *expansions == MAX_BRACE_EXPANSIONS {
+            return EquivalentMatch::Indeterminate;
+        }
+        *expansions += 1;
+        let concrete = classify_globstars(current);
+        for units in unit_sets {
+            if *attempts == MAX_MATCH_ATTEMPTS {
+                return EquivalentMatch::Indeterminate;
+            }
+            *attempts += 1;
+            if match_tokens(&concrete, units) {
+                return EquivalentMatch::Match;
+            }
+        }
+        return EquivalentMatch::NoMatch;
+    };
+    stack.last_mut().unwrap().1 += 1;
+
+    match &sequence[index] {
+        GlobToken::Alternatives(alternatives) => {
+            for alternative in alternatives {
+                let mut branch = stack.clone();
+                branch.push((alternative, 0));
+                match walk_expansions(branch, current, unit_sets, expansions, attempts) {
+                    EquivalentMatch::NoMatch => {}
+                    result => return result,
+                }
+            }
+            EquivalentMatch::NoMatch
+        }
+        token => {
+            current.push(token.clone());
+            let result = walk_expansions(stack, current, unit_sets, expansions, attempts);
+            current.pop();
+            result
+        }
+    }
+}
+
+fn classify_globstars(tokens: &[GlobToken]) -> Vec<GlobToken> {
+    let mut concrete = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if matches!(tokens[index], GlobToken::DoubleStar) {
+            let component_start = index == 0 || matches!(tokens[index - 1], GlobToken::Separator);
+            let component_end =
+                index + 1 == tokens.len() || matches!(tokens[index + 1], GlobToken::Separator);
+            if component_start && component_end {
+                if index + 1 < tokens.len() {
+                    concrete.push(GlobToken::GlobStarDirectory);
+                    index += 2;
+                } else {
+                    concrete.push(GlobToken::GlobStar);
+                    index += 1;
+                }
+            } else {
+                concrete.push(GlobToken::Star);
+                index += 1;
+            }
+        } else {
+            debug_assert!(!matches!(tokens[index], GlobToken::Alternatives(_)));
+            concrete.push(tokens[index].clone());
+            index += 1;
+        }
+    }
+    concrete
 }
 
 fn match_tokens(tokens: &[GlobToken], units: &[NameUnit]) -> bool {
@@ -390,13 +485,8 @@ fn match_sequence(tokens: &[GlobToken], units: &[NameUnit], mut next: Vec<bool>)
                     current[unit_index] = next[unit_index] || later_separator_matches;
                 }
             }
-            GlobToken::Alternatives(alternatives) => {
-                for alternative in alternatives {
-                    let alternative = match_sequence(alternative, units, next.clone());
-                    for (matched, branch) in current.iter_mut().zip(alternative) {
-                        *matched |= branch;
-                    }
-                }
+            GlobToken::DoubleStar | GlobToken::Alternatives(_) => {
+                unreachable!("globstar classification and brace expansion happen before matching")
             }
         }
         next = current;
@@ -410,7 +500,7 @@ fn consume_literal(expected: &str, units: &[NameUnit], start: usize) -> Option<u
         if unit.separator {
             return None;
         }
-        actual.push_str(&unit.folded);
+        actual.push(unit.ch);
         if actual == expected {
             return Some(start + offset + 1);
         }
@@ -431,11 +521,11 @@ fn equivalent_character_ends(units: &[NameUnit], start: usize) -> Vec<usize> {
         if unit.separator {
             break;
         }
-        text.push_str(&unit.text);
+        text.push(unit.ch);
         let mut composed = text.nfc();
         if composed.next().is_some() && composed.next().is_none() {
             ends.push(start + offset + 1);
-        } else if offset > 0 && canonical_combining_class(unit.text.chars().next().unwrap()) == 0 {
+        } else if offset > 0 && canonical_combining_class(unit.ch) == 0 {
             // Canonical composition never joins across two already-complete
             // starters. Hangul is the exception that reaches this point, and
             // successful L/V/T compositions were recorded above.
@@ -454,10 +544,7 @@ fn class_match_ends(
     equivalent_character_ends(units, start)
         .into_iter()
         .filter(|end| {
-            let text: String = units[start..*end]
-                .iter()
-                .map(|unit| unit.text.as_str())
-                .collect();
+            let text: String = units[start..*end].iter().map(|unit| unit.ch).collect();
             equivalent_class_chars(&text).into_iter().any(|candidate| {
                 let contained = ranges
                     .iter()
@@ -554,8 +641,32 @@ mod tests {
         ));
         let many_braces = format!("{}.txt", "{a,b}".repeat(9));
         assert!(glob_matches_folded(&many_braces, "AAAAAAAAA.TXT"));
+        assert!(glob_matches_folded("{**/foo,bar}", "FOO"));
+        assert!(glob_matches_folded("{**/foo,bar}", "a/b/FOO"));
+        assert!(glob_matches_folded("{**,other}/foo.txt", "FOO.TXT"));
+        assert!(glob_matches_folded("{**,other}/foo.txt", "a/b/FOO.TXT"));
         assert!(glob_matches_folded("\u{e1}*.txt", "\u{e1}\u{327}.TXT"));
         assert!(glob_matches_folded("\u{e1}*.txt", "a\u{327}\u{301}.TXT"));
+        assert!(glob_matches_folded(
+            "a\u{327}\u{301}*.txt",
+            "a\u{327}\u{328}\u{301}.TXT"
+        ));
+        assert!(glob_matches_folded(
+            "a\u{301}*\u{301}.txt",
+            "a\u{327}\u{301}\u{301}.TXT"
+        ));
+        assert!(glob_matches_folded(
+            "{x\u{327}*,\u{e1}*}.txt",
+            "a\u{327}\u{301}.TXT"
+        ));
+        assert!(glob_matches_folded(
+            "x\u{327}*/\u{e1}*.txt",
+            "x\u{327}/a\u{327}\u{301}.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "a\u{328}\u{327}*.txt",
+            "a\u{327}\u{328}\u{301}.TXT"
+        ));
         assert!(!glob_matches_folded("**/.git/**", "x/git/config"));
     }
 
