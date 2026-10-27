@@ -452,7 +452,7 @@ fn iota_spelling_demand(tokens: &[GlobToken]) -> usize {
                 .chars()
                 .filter(|ch| char_decomposes_to_iota_subscript(*ch))
                 .count(),
-            GlobToken::Any => 1,
+            GlobToken::Any | GlobToken::Star | GlobToken::DoubleStar => 1,
             GlobToken::Class { negated, ranges } => usize::from(
                 *negated
                     || ranges
@@ -464,7 +464,7 @@ fn iota_spelling_demand(tokens: &[GlobToken]) -> usize {
                 .map(|alternative| iota_spelling_demand(alternative))
                 .max()
                 .unwrap_or(0),
-            GlobToken::Separator | GlobToken::Star | GlobToken::DoubleStar => 0,
+            GlobToken::Separator => 0,
         })
     })
 }
