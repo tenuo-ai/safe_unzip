@@ -154,6 +154,50 @@ fn large_brace_nonmatch_does_not_exclude_unrelated_files() {
 }
 
 #[test]
+fn normalization_across_braces_is_excluded_by_both_apis() {
+    let pattern = "\u{3b1}{\u{345},x}\u{301}.txt";
+    let zip = make_zip(&[("\u{3b1}\u{345}\u{301}.TXT", b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+}
+
+#[test]
+fn many_independent_name_variants_do_not_exclude_a_nonmatch() {
+    let name = format!("{}.txt", "\u{1ead}".repeat(9));
+    let zip = make_zip(&[(&name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&["*.exe"])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&["*.exe"])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
 fn include_and_only_stay_exact() {
     let zip = make_zip(&[("README.md", b"a"), ("readme.md", b"b")]);
     let dest = tempdir().unwrap();

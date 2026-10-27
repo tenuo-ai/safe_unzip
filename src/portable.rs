@@ -80,6 +80,18 @@ struct PreFoldUnit {
     source_char: char,
 }
 
+#[derive(Debug, Clone)]
+struct NameEdge {
+    unit: NameUnit,
+    target: usize,
+}
+
+#[derive(Debug)]
+struct NameGraph {
+    edges: Vec<Vec<NameEdge>>,
+    end: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EquivalentMatch {
     Match,
@@ -87,7 +99,7 @@ enum EquivalentMatch {
     Indeterminate,
 }
 
-const MAX_CANONICAL_VARIANTS: usize = 256;
+const MAX_CANONICAL_CLUSTER_VARIANTS: usize = 256;
 const MAX_COMBINING_MARKS_PER_CLUSTER: usize = 64;
 
 /// Match a glob against any case- or normalization-equivalent spelling of a
@@ -98,10 +110,10 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
     let Some(tokens) = tokenize_glob(pattern) else {
         return EquivalentMatch::NoMatch;
     };
-    let Some(unit_sets) = canonical_name_variants(name) else {
+    let Some(graph) = canonical_name_graph(name) else {
         return EquivalentMatch::Indeterminate;
     };
-    if unit_sets.iter().any(|units| match_tokens(&tokens, units)) {
+    if match_tokens(&tokens, &graph) {
         EquivalentMatch::Match
     } else {
         EquivalentMatch::NoMatch
@@ -197,8 +209,7 @@ fn tokenize_sequence(
 
 fn push_literal(tokens: &mut Vec<GlobToken>, literal: &mut String) {
     if !literal.is_empty() {
-        tokens.push(GlobToken::Literal(fold_for_glob(literal)));
-        literal.clear();
+        tokens.push(GlobToken::Literal(std::mem::take(literal)));
     }
 }
 
@@ -248,7 +259,7 @@ fn class_char(chars: &[char], i: usize) -> Option<(char, usize)> {
 /// Combining marks with the same class retain their relative order, while
 /// marks from different classes may interleave. The bound keeps malicious
 /// names from causing combinatorial work.
-fn canonical_name_variants(name: &str) -> Option<Vec<Vec<NameUnit>>> {
+fn canonical_name_graph(name: &str) -> Option<NameGraph> {
     let pre_fold = canonical_pre_fold_units(name)?;
     let mut base = Vec::new();
     let mut source_totals = vec![0; name.chars().count()];
@@ -273,11 +284,14 @@ fn canonical_name_variants(name: &str) -> Option<Vec<Vec<NameUnit>>> {
         unit.source_total = source_totals[unit.source];
     }
 
-    let mut variants = vec![Vec::new()];
+    let mut graph = NameGraph {
+        edges: vec![Vec::new()],
+        end: 0,
+    };
     let mut cluster = Vec::new();
     for unit in base {
         if canonical_combining_class(unit.ch) == 0 && !cluster.is_empty() {
-            append_canonical_cluster(&mut variants, &cluster)?;
+            append_canonical_cluster(&mut graph, &cluster)?;
             cluster.clear();
         }
         cluster.push(unit);
@@ -287,9 +301,9 @@ fn canonical_name_variants(name: &str) -> Option<Vec<Vec<NameUnit>>> {
         }
     }
     if !cluster.is_empty() {
-        append_canonical_cluster(&mut variants, &cluster)?;
+        append_canonical_cluster(&mut graph, &cluster)?;
     }
-    Some(variants)
+    Some(graph)
 }
 
 fn canonical_pre_fold_units(name: &str) -> Option<Vec<PreFoldUnit>> {
@@ -326,28 +340,30 @@ fn append_pre_fold_cluster(result: &mut Vec<PreFoldUnit>, cluster: &mut Vec<PreF
     result.append(cluster);
 }
 
-fn append_canonical_cluster(variants: &mut Vec<Vec<NameUnit>>, cluster: &[NameUnit]) -> Option<()> {
+fn append_canonical_cluster(graph: &mut NameGraph, cluster: &[NameUnit]) -> Option<()> {
     let cluster_variants = canonical_cluster_variants(cluster)?;
-    if variants.len().checked_mul(cluster_variants.len())? > MAX_CANONICAL_VARIANTS {
-        return None;
-    }
-    if cluster_variants.len() == 1 {
-        let suffix = &cluster_variants[0];
-        for prefix in variants {
-            prefix.extend_from_slice(suffix);
-        }
-    } else {
-        let prefixes = std::mem::take(variants);
-        variants.reserve(prefixes.len() * cluster_variants.len());
-        for prefix in prefixes {
-            for suffix in &cluster_variants {
-                let mut spelling = Vec::with_capacity(prefix.len() + suffix.len());
-                spelling.extend_from_slice(&prefix);
-                spelling.extend_from_slice(suffix);
-                variants.push(spelling);
+    let start = graph.end;
+    let mut final_edges = Vec::with_capacity(cluster_variants.len());
+    for variant in cluster_variants {
+        let mut node = start;
+        let mut units = variant.into_iter().peekable();
+        while let Some(unit) = units.next() {
+            if units.peek().is_none() {
+                final_edges.push((node, unit));
+                break;
             }
+            let target = graph.edges.len();
+            graph.edges.push(Vec::new());
+            graph.edges[node].push(NameEdge { unit, target });
+            node = target;
         }
     }
+    let end = graph.edges.len();
+    graph.edges.push(Vec::new());
+    for (node, unit) in final_edges {
+        graph.edges[node].push(NameEdge { unit, target: end });
+    }
+    graph.end = end;
     Some(())
 }
 
@@ -394,7 +410,7 @@ fn interleave_combining_groups(
         .zip(groups)
         .all(|(position, (_, group))| *position == group.len())
     {
-        if results.len() == MAX_CANONICAL_VARIANTS {
+        if results.len() == MAX_CANONICAL_CLUSTER_VARIANTS {
             return None;
         }
         results.push(current.clone());
@@ -419,10 +435,11 @@ struct MatchState {
     positions: Vec<bool>,
     component_start: bool,
     pending_stars: u8,
+    pending_literal: String,
 }
 
-fn match_tokens(tokens: &[GlobToken], units: &[NameUnit]) -> bool {
-    let mut positions = vec![false; units.len() + 1];
+fn match_tokens(tokens: &[GlobToken], graph: &NameGraph) -> bool {
+    let mut positions = vec![false; graph.edges.len()];
     positions[0] = true;
     let states = advance_sequence(
         tokens,
@@ -430,27 +447,30 @@ fn match_tokens(tokens: &[GlobToken], units: &[NameUnit]) -> bool {
             positions,
             component_start: true,
             pending_stars: 0,
+            pending_literal: String::new(),
         }],
-        units,
+        graph,
     );
-    finish_states(states, units)
+    finish_states(states, graph)
         .iter()
-        .any(|state| state.positions[units.len()])
+        .any(|state| state.positions[graph.end])
 }
 
 fn advance_sequence(
     tokens: &[GlobToken],
     mut states: Vec<MatchState>,
-    units: &[NameUnit],
+    graph: &NameGraph,
 ) -> Vec<MatchState> {
     for token in tokens {
         states = match token {
+            GlobToken::Literal(literal) => advance_literal(literal, states, graph),
             GlobToken::Star | GlobToken::DoubleStar => {
                 let count = if matches!(token, GlobToken::DoubleStar) {
                     2
                 } else {
                     1
                 };
+                let mut states = flush_pending_literals(states, graph);
                 for state in &mut states {
                     state.pending_stars = state.pending_stars.saturating_add(count).min(2);
                 }
@@ -460,12 +480,12 @@ fn advance_sequence(
                 let mut branches = Vec::new();
                 for state in states {
                     for alternative in alternatives {
-                        branches.extend(advance_sequence(alternative, vec![state.clone()], units));
+                        branches.extend(advance_sequence(alternative, vec![state.clone()], graph));
                     }
                 }
                 merge_states(branches)
             }
-            _ => advance_nonstar(token, states, units),
+            _ => advance_nonstar(token, states, graph),
         };
     }
     states
@@ -474,37 +494,37 @@ fn advance_sequence(
 fn advance_nonstar(
     token: &GlobToken,
     states: Vec<MatchState>,
-    units: &[NameUnit],
+    graph: &NameGraph,
 ) -> Vec<MatchState> {
     let mut advanced = Vec::new();
-    for mut state in states {
+    for mut state in flush_pending_literals(states, graph) {
         if state.pending_stars >= 2
             && state.component_start
             && matches!(token, GlobToken::Separator)
         {
-            state.positions = globstar_directory_positions(&state.positions, units);
+            state.positions = globstar_directory_positions(&state.positions, graph);
             state.pending_stars = 0;
             state.component_start = true;
             advanced.push(state);
             continue;
         }
         if state.pending_stars > 0 {
-            state.positions = star_positions(&state.positions, units, false);
+            state.positions = star_positions(&state.positions, graph, false);
             state.pending_stars = 0;
         }
-        state.positions = token_positions(token, &state.positions, units);
+        state.positions = token_positions(token, &state.positions, graph);
         state.component_start = matches!(token, GlobToken::Separator);
         advanced.push(state);
     }
     merge_states(advanced)
 }
 
-fn finish_states(states: Vec<MatchState>, units: &[NameUnit]) -> Vec<MatchState> {
+fn finish_states(states: Vec<MatchState>, graph: &NameGraph) -> Vec<MatchState> {
     let mut finished = Vec::new();
-    for mut state in states {
+    for mut state in flush_pending_literals(states, graph) {
         if state.pending_stars > 0 {
             let crosses_separators = state.pending_stars >= 2 && state.component_start;
-            state.positions = star_positions(&state.positions, units, crosses_separators);
+            state.positions = star_positions(&state.positions, graph, crosses_separators);
             state.pending_stars = 0;
         }
         finished.push(state);
@@ -518,6 +538,7 @@ fn merge_states(states: Vec<MatchState>) -> Vec<MatchState> {
         if let Some(existing) = merged.iter_mut().find(|existing| {
             existing.component_start == state.component_start
                 && existing.pending_stars == state.pending_stars
+                && existing.pending_literal == state.pending_literal
         }) {
             for (target, source) in existing.positions.iter_mut().zip(state.positions) {
                 *target |= source;
@@ -529,30 +550,77 @@ fn merge_states(states: Vec<MatchState>) -> Vec<MatchState> {
     merged
 }
 
-fn token_positions(token: &GlobToken, positions: &[bool], units: &[NameUnit]) -> Vec<bool> {
-    let mut next = vec![false; units.len() + 1];
+fn advance_literal(literal: &str, states: Vec<MatchState>, graph: &NameGraph) -> Vec<MatchState> {
+    let mut advanced = Vec::new();
+    for mut state in states {
+        if state.pending_stars > 0 {
+            state.positions = star_positions(&state.positions, graph, false);
+            state.pending_stars = 0;
+        }
+        for ch in literal.nfd() {
+            if canonical_combining_class(ch) == 0 && !state.pending_literal.is_empty() {
+                flush_pending_literal(&mut state, graph);
+            }
+            state.pending_literal.push(ch);
+        }
+        advanced.push(state);
+    }
+    merge_states(advanced)
+}
+
+fn flush_pending_literals(states: Vec<MatchState>, graph: &NameGraph) -> Vec<MatchState> {
+    let mut flushed = Vec::new();
+    for mut state in states {
+        flush_pending_literal(&mut state, graph);
+        flushed.push(state);
+    }
+    merge_states(flushed)
+}
+
+fn flush_pending_literal(state: &mut MatchState, graph: &NameGraph) {
+    if state.pending_literal.is_empty() {
+        return;
+    }
+    let expected = fold_for_glob(&state.pending_literal);
+    state.positions = literal_positions(&expected, &state.positions, graph);
+    state.pending_literal.clear();
+    state.component_start = false;
+}
+
+fn literal_positions(expected: &str, positions: &[bool], graph: &NameGraph) -> Vec<bool> {
+    let mut next = vec![false; graph.edges.len()];
     for (start, matched) in positions.iter().copied().enumerate() {
-        if !matched || start == units.len() {
+        if matched {
+            for end in consume_literal(expected, graph, start) {
+                next[end] = true;
+            }
+        }
+    }
+    next
+}
+
+fn token_positions(token: &GlobToken, positions: &[bool], graph: &NameGraph) -> Vec<bool> {
+    let mut next = vec![false; graph.edges.len()];
+    for (start, matched) in positions.iter().copied().enumerate() {
+        if !matched || start == graph.end {
             continue;
         }
         match token {
-            GlobToken::Literal(expected) => {
-                if let Some(end) = consume_literal(expected, units, start) {
-                    next[end] = true;
-                }
-            }
+            GlobToken::Literal(_) => unreachable!("literal fragments are buffered before matching"),
             GlobToken::Separator => {
-                if units[start].separator {
-                    next[start + 1] = true;
+                for edge in &graph.edges[start] {
+                    if edge.unit.separator {
+                        next[edge.target] = true;
+                    }
                 }
             }
             GlobToken::Any => {
-                for end in equivalent_character_ends(units, start) {
+                for (end, _) in equivalent_character_paths(graph, start) {
                     next[end] = true;
                 }
             }
             GlobToken::Class { negated, ranges } => {
-                for end in class_match_ends(*negated, ranges, units, start) {
+                for end in class_match_ends(*negated, ranges, graph, start) {
                     next[end] = true;
                 }
             }
@@ -564,111 +632,126 @@ fn token_positions(token: &GlobToken, positions: &[bool], units: &[NameUnit]) ->
     next
 }
 
-fn star_positions(positions: &[bool], units: &[NameUnit], crosses_separators: bool) -> Vec<bool> {
-    let mut next = vec![false; positions.len()];
-    let mut reachable = false;
-    for index in 0..positions.len() {
-        reachable |= positions[index];
-        next[index] = reachable;
-        if index < units.len() && units[index].separator && !crosses_separators {
-            reachable = false;
-        }
-    }
-    next
-}
-
-fn globstar_directory_positions(positions: &[bool], units: &[NameUnit]) -> Vec<bool> {
+fn star_positions(positions: &[bool], graph: &NameGraph, crosses_separators: bool) -> Vec<bool> {
     let mut next = positions.to_vec();
-    let mut reachable = false;
-    for index in 0..units.len() {
-        reachable |= positions[index];
-        if reachable && units[index].separator {
-            next[index + 1] = true;
+    for node in 0..graph.edges.len() {
+        if next[node] {
+            for edge in &graph.edges[node] {
+                if crosses_separators || !edge.unit.separator {
+                    next[edge.target] = true;
+                }
+            }
         }
     }
     next
 }
 
-fn consume_literal(expected: &str, units: &[NameUnit], start: usize) -> Option<usize> {
-    let mut actual = String::new();
-    for (offset, unit) in units[start..].iter().enumerate() {
-        if unit.separator {
-            return None;
-        }
-        actual.push(unit.ch);
-        if actual == expected {
-            return Some(start + offset + 1);
-        }
-        if !expected.starts_with(&actual) {
-            return None;
+fn globstar_directory_positions(positions: &[bool], graph: &NameGraph) -> Vec<bool> {
+    let mut next = positions.to_vec();
+    let mut reachable = positions.to_vec();
+    for node in 0..graph.edges.len() {
+        if reachable[node] {
+            for edge in &graph.edges[node] {
+                reachable[edge.target] = true;
+                if edge.unit.separator {
+                    next[edge.target] = true;
+                }
+            }
         }
     }
-    None
+    next
 }
 
-fn equivalent_character_ends(units: &[NameUnit], start: usize) -> Vec<usize> {
-    if units.get(start).is_none_or(|unit| unit.separator) {
-        return Vec::new();
-    }
-    let mut text = String::new();
+fn consume_literal(expected: &str, graph: &NameGraph, start: usize) -> Vec<usize> {
+    let expected: Vec<char> = expected.chars().collect();
     let mut ends = Vec::new();
-    for (offset, unit) in units[start..].iter().enumerate() {
-        if unit.separator {
-            break;
+    let mut stack = vec![(start, 0)];
+    while let Some((node, offset)) = stack.pop() {
+        if offset == expected.len() {
+            if !ends.contains(&node) {
+                ends.push(node);
+            }
+            continue;
         }
-        text.push(unit.ch);
-        let end = start + offset + 1;
-        let mut composed = text.nfc();
-        if (composed.next().is_some() && composed.next().is_none())
-            || original_scalar(units, start, end).is_some()
-            || pre_fold_scalar(units, start, end).is_some()
-        {
-            ends.push(end);
-        } else if offset > 0
-            && canonical_combining_class(unit.ch) == 0
-            && !incomplete_source_scalar(units, start, end)
-            && !incomplete_pre_fold_unit(units, start, end)
-        {
-            // Canonical composition never joins across two already-complete
-            // starters. Hangul is the exception that reaches this point, and
-            // successful L/V/T compositions were recorded above.
-            break;
+        for edge in &graph.edges[node] {
+            if !edge.unit.separator && edge.unit.ch == expected[offset] {
+                stack.push((edge.target, offset + 1));
+            }
         }
     }
     ends
 }
 
+fn equivalent_character_paths(graph: &NameGraph, start: usize) -> Vec<(usize, Vec<NameUnit>)> {
+    let mut ends = Vec::new();
+    let mut stack = vec![(start, Vec::new())];
+    while let Some((node, path)) = stack.pop() {
+        for edge in &graph.edges[node] {
+            if edge.unit.separator {
+                continue;
+            }
+            let mut path = path.clone();
+            path.push(edge.unit.clone());
+            let (endpoint, keep_scanning) = character_path_status(&path);
+            if endpoint {
+                ends.push((edge.target, path.clone()));
+            }
+            if keep_scanning {
+                stack.push((edge.target, path));
+            }
+        }
+    }
+    ends
+}
+
+fn character_path_status(path: &[NameUnit]) -> (bool, bool) {
+    let text: String = path.iter().map(|unit| unit.ch).collect();
+    let mut composed = text.nfc();
+    let endpoint = (composed.next().is_some() && composed.next().is_none())
+        || original_scalar(path, 0, path.len()).is_some()
+        || pre_fold_scalar(path, 0, path.len()).is_some();
+    let last = path.last().unwrap();
+    let reached_new_starter = path.len() > 1
+        && canonical_combining_class(last.ch) == 0
+        && !incomplete_source_scalar(path, 0, path.len())
+        && !incomplete_pre_fold_unit(path, 0, path.len());
+    (endpoint, endpoint || !reached_new_starter)
+}
+
 fn class_match_ends(
     negated: bool,
     ranges: &[(char, char)],
-    units: &[NameUnit],
+    graph: &NameGraph,
     start: usize,
 ) -> Vec<usize> {
-    equivalent_character_ends(units, start)
+    equivalent_character_paths(graph, start)
         .into_iter()
-        .filter(|end| {
-            let text: String = units[start..*end].iter().map(|unit| unit.ch).collect();
+        .filter_map(|(end, path)| {
+            let text: String = path.iter().map(|unit| unit.ch).collect();
             let mut candidates = equivalent_class_chars(&text);
-            if let Some(original) = original_scalar(units, start, *end) {
+            if let Some(original) = original_scalar(&path, 0, path.len()) {
                 for candidate in equivalent_class_chars(&original.to_string()) {
                     if !candidates.contains(&candidate) {
                         candidates.push(candidate);
                     }
                 }
             }
-            if let Some(pre_fold) = pre_fold_scalar(units, start, *end) {
+            if let Some(pre_fold) = pre_fold_scalar(&path, 0, path.len()) {
                 for candidate in equivalent_class_chars(&pre_fold.to_string()) {
                     if !candidates.contains(&candidate) {
                         candidates.push(candidate);
                     }
                 }
             }
-            candidates.into_iter().any(|candidate| {
-                let contained = ranges
-                    .iter()
-                    .any(|(low, high)| *low <= candidate && candidate <= *high);
-                contained != negated
-            })
+            candidates
+                .into_iter()
+                .any(|candidate| {
+                    let contained = ranges
+                        .iter()
+                        .any(|(low, high)| *low <= candidate && candidate <= *high);
+                    contained != negated
+                })
+                .then_some(end)
         })
         .collect()
 }
@@ -843,6 +926,10 @@ mod tests {
             "\u{3b1}\u{301}\u{345}.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
         ));
+        assert!(glob_matches_folded(
+            "\u{3b1}{\u{345},x}\u{301}.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
         assert!(glob_matches_folded("\u{e1}*.txt", "\u{e1}\u{327}.TXT"));
         assert!(glob_matches_folded("\u{e1}*.txt", "a\u{327}\u{301}.TXT"));
         assert!(glob_matches_folded(
@@ -870,17 +957,20 @@ mod tests {
             "\u{1e69}.TXT"
         ));
         assert!(!glob_matches_folded("**/.git/**", "x/git/config"));
+        assert!(!glob_matches_folded(
+            "*.exe",
+            &format!("{}.txt", "\u{1ead}".repeat(9))
+        ));
     }
 
     #[test]
     fn canonical_variant_generation_is_bounded_and_linear_for_simple_names() {
         let long_ascii_name = "a".repeat(65_535);
-        let variants = canonical_name_variants(&long_ascii_name).unwrap();
-        assert_eq!(variants.len(), 1);
-        assert_eq!(variants[0].len(), long_ascii_name.len());
+        let graph = canonical_name_graph(&long_ascii_name).unwrap();
+        assert_eq!(graph.end, long_ascii_name.len());
 
         let too_many_marks = format!("a{}", "\u{301}".repeat(MAX_COMBINING_MARKS_PER_CLUSTER + 1));
-        assert!(canonical_name_variants(&too_many_marks).is_none());
+        assert!(canonical_name_graph(&too_many_marks).is_none());
 
         let expensive_if_folded = format!("{}{}", "a\u{327}\u{301}".repeat(8), "z".repeat(60_000));
         assert!(glob_matches_folded("*", &expensive_if_folded));
