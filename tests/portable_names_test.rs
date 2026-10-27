@@ -507,6 +507,29 @@ fn equal_class_combining_braces_do_not_exhaust_match_states() {
 }
 
 #[test]
+fn alternating_combining_braces_reject_suffix_before_state_limit() {
+    let pattern = format!("a{}.exe", "{\u{301},\u{300}}".repeat(11));
+    let name = format!("a{}.TXT", "\u{301}\u{300}".repeat(11));
+    let zip = make_zip(&[(&name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
 fn interleaved_prefold_composition_is_excluded_by_both_apis() {
     let pattern = "[\u{130}]*.txt";
     let zip = make_zip(&[("I\u{327}\u{307}.TXT", b"x")]);

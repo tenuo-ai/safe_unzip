@@ -131,16 +131,16 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
             EquivalentMatch::NoMatch
         };
     }
+    if let Some(suffix) = ascii_literal_suffix(&tokens) {
+        if !fold_for_glob(name).ends_with(&suffix) {
+            return EquivalentMatch::NoMatch;
+        }
+    }
     let linear = linear_folded_name_graph(name);
     match match_tokens(&tokens, &linear, false) {
         Some(true) => return EquivalentMatch::Match,
         Some(false) => {}
         None => return EquivalentMatch::Indeterminate,
-    }
-    if let Some(suffix) = ascii_literal_suffix(&tokens) {
-        if !fold_for_glob(name).ends_with(&suffix) {
-            return EquivalentMatch::NoMatch;
-        }
     }
     if literal_only(&tokens) {
         return EquivalentMatch::NoMatch;
@@ -205,7 +205,6 @@ fn ascii_literal_suffix(tokens: &[GlobToken]) -> Option<String> {
     for token in tokens.iter().rev() {
         match token {
             GlobToken::Literal(literal) if literal.is_ascii() => parts.push(literal.as_str()),
-            GlobToken::Separator => parts.push("/"),
             _ => break,
         }
     }
@@ -993,6 +992,14 @@ fn advance_literal(
             state.pending_stars = 0;
         }
         for ch in literal.nfd() {
+            if !state
+                .positions
+                .iter()
+                .any(|position| *position != UNREACHABLE)
+            {
+                state.pending_literal.clear();
+                break;
+            }
             if canonical_combining_class(ch) == 0 && !state.pending_literal.is_empty() {
                 flush_pending_literal(&mut state, graph);
             }
@@ -1680,6 +1687,12 @@ mod tests {
         assert!(!glob_matches_folded(
             "\u{3b1}\u{345}*.txt",
             &long_pending_probe
+        ));
+        let immediate_literal_mismatch = format!("{}*.txt", "a".repeat(60_000));
+        let long_name = format!("{}.TXT", "a".repeat(60_000));
+        assert!(!glob_matches_folded(
+            &format!("b{immediate_literal_mismatch}"),
+            &long_name
         ));
         let branching_pending_probe = format!("\u{3b1}{}.TXT", "a\u{301}\u{327}".repeat(16));
         assert!(!glob_matches_folded(
