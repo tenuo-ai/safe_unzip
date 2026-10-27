@@ -95,8 +95,17 @@ fn driver_exclude_matches_equivalent_names() {
 
 #[test]
 fn expanded_case_fold_scalars_are_excluded_by_both_apis() {
-    for pattern in ["?.txt", "[\u{df}].txt"] {
-        let zip = make_zip(&[("\u{df}.TXT", b"x")]);
+    for (pattern, name) in [
+        ("?.txt", "\u{df}.TXT"),
+        ("[\u{df}].txt", "\u{df}.TXT"),
+        ("?.txt", "I\u{307}.TXT"),
+        ("[\u{130}].txt", "I\u{307}.TXT"),
+        ("?.txt", "\u{fb03}.TXT"),
+        ("[\u{fb03}].txt", "\u{fb03}.TXT"),
+        ("?.txt", "\u{fb04}.TXT"),
+        ("[\u{fb04}].txt", "\u{fb04}.TXT"),
+    ] {
+        let zip = make_zip(&[(name, b"x")]);
 
         let dest = tempdir().unwrap();
         Extractor::new(dest.path())
@@ -104,7 +113,10 @@ fn expanded_case_fold_scalars_are_excluded_by_both_apis() {
             .exclude_glob(&[pattern])
             .extract(Cursor::new(zip.clone()))
             .unwrap();
-        assert!(files_under(dest.path()).is_empty(), "Extractor: {pattern}");
+        assert!(
+            files_under(dest.path()).is_empty(),
+            "Extractor: {pattern} against {name}"
+        );
 
         let dest = tempdir().unwrap();
         Driver::new(dest.path())
@@ -112,8 +124,33 @@ fn expanded_case_fold_scalars_are_excluded_by_both_apis() {
             .exclude_glob(&[pattern])
             .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
             .unwrap();
-        assert!(files_under(dest.path()).is_empty(), "Driver: {pattern}");
+        assert!(
+            files_under(dest.path()).is_empty(),
+            "Driver: {pattern} against {name}"
+        );
     }
+}
+
+#[test]
+fn large_brace_nonmatch_does_not_exclude_unrelated_files() {
+    let pattern = format!("{}.txt", "{a,b}".repeat(13));
+    let zip = make_zip(&[("unrelated.rs", b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), ["unrelated.rs"]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), ["unrelated.rs"]);
 }
 
 #[test]
