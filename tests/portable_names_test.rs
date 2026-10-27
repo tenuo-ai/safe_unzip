@@ -222,8 +222,18 @@ fn normalization_before_a_wildcard_is_excluded_by_both_apis() {
 #[test]
 fn folded_starter_before_a_wildcard_is_excluded_by_both_apis() {
     let pattern = "\u{3b1}\u{345}*.txt";
-    let names = ["\u{3b1}\u{345}.txt", "\u{3b1}\u{3b9}.TXT"];
-    let zip = make_zip(&[(names[0], b"x"), (names[1], b"y")]);
+    let names = [
+        "\u{3b1}\u{345}.txt",
+        "\u{3b1}\u{3b9}.TXT",
+        "\u{3b1}\u{345}\u{301}.txt",
+        "\u{3b1}\u{301}\u{3b9}.TXT",
+    ];
+    let zip = make_zip(&[
+        (names[0], b"w"),
+        (names[1], b"x"),
+        (names[2], b"y"),
+        (names[3], b"z"),
+    ]);
 
     let dest = tempdir().unwrap();
     Extractor::new(dest.path())
@@ -307,6 +317,29 @@ fn unreachable_combining_braces_do_not_exhaust_match_states() {
         .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
         .unwrap();
     assert_eq!(files_under(dest.path()), ["a.txt"]);
+}
+
+#[test]
+fn equal_class_combining_braces_do_not_exhaust_match_states() {
+    let pattern = format!("a{}.exe", "{\u{301},\u{300}}".repeat(11));
+    let name = format!("a{}{}.TXT", "\u{301}".repeat(11), "\u{300}".repeat(11));
+    let zip = make_zip(&[(&name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
 }
 
 #[test]

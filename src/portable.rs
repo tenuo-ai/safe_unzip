@@ -107,6 +107,7 @@ enum EquivalentMatch {
 }
 
 const MAX_CANONICAL_CLUSTER_VARIANTS: usize = 256;
+const MAX_EQUIVALENT_PRE_FOLD_SPELLINGS: usize = 256;
 const MAX_COMBINING_MARKS_PER_CLUSTER: usize = 64;
 const MAX_NAME_GRAPH_ITEMS: usize = 65_536;
 const MAX_MATCH_STATES: usize = 1_024;
@@ -139,13 +140,21 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
     if literal_only(&tokens) {
         return EquivalentMatch::NoMatch;
     }
-    let Some(graph) = canonical_name_graph(name) else {
+    let Some(graphs) = canonical_name_graphs(name) else {
         return EquivalentMatch::Indeterminate;
     };
-    match match_tokens(&tokens, &graph, true) {
-        Some(true) => EquivalentMatch::Match,
-        Some(false) => EquivalentMatch::NoMatch,
-        None => EquivalentMatch::Indeterminate,
+    let mut indeterminate = false;
+    for graph in graphs {
+        match match_tokens(&tokens, &graph, true) {
+            Some(true) => return EquivalentMatch::Match,
+            Some(false) => {}
+            None => indeterminate = true,
+        }
+    }
+    if indeterminate {
+        EquivalentMatch::Indeterminate
+    } else {
+        EquivalentMatch::NoMatch
     }
 }
 
@@ -383,6 +392,38 @@ fn canonical_name_graph(name: &str) -> Option<NameGraph> {
         append_pre_fold_cluster(&mut graph, &cluster)?;
     }
     Some(graph)
+}
+
+fn canonical_name_graphs(name: &str) -> Option<Vec<NameGraph>> {
+    let original = canonical_name_graph(name)?;
+    let mut total_edges = original.edge_count;
+    let mut graphs = vec![original];
+    let folded: Vec<char> = fold_for_glob(name).chars().collect();
+    let iota_indexes: Vec<usize> = folded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| (*ch == '\u{3b9}').then_some(index))
+        .collect();
+    let spelling_count = 1usize.checked_shl(u32::try_from(iota_indexes.len()).ok()?)?;
+    if spelling_count > MAX_EQUIVALENT_PRE_FOLD_SPELLINGS {
+        return None;
+    }
+    for mask in 1..spelling_count {
+        let mut spelling = folded.clone();
+        for (bit, index) in iota_indexes.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                spelling[*index] = '\u{345}';
+            }
+        }
+        let spelling: String = spelling.into_iter().collect();
+        let graph = canonical_name_graph(&spelling)?;
+        total_edges = total_edges.checked_add(graph.edge_count)?;
+        if total_edges > MAX_NAME_GRAPH_ITEMS {
+            return None;
+        }
+        graphs.push(graph);
+    }
+    Some(graphs)
 }
 
 fn pre_fold_clusters(name: &str) -> Option<Vec<Vec<PreFoldUnit>>> {
@@ -883,17 +924,21 @@ fn pending_cluster_can_continue(state: &MatchState, graph: &NameGraph) -> bool {
     if state.pending_literal.is_empty() {
         return true;
     }
-    let mut required: Vec<(char, usize)> = Vec::new();
+    let mut required: Vec<(u8, Vec<char>)> = Vec::new();
     for ch in fold_for_glob(&state.pending_literal).chars() {
-        if let Some((_, count)) = required.iter_mut().find(|(candidate, _)| *candidate == ch) {
-            *count += 1;
+        let class = canonical_combining_class(ch);
+        if let Some((_, chars)) = required
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == class)
+        {
+            chars.push(ch);
         } else {
-            required.push((ch, 1));
+            required.push((class, vec![ch]));
         }
     }
     let has_folded_starter = required
         .iter()
-        .any(|(ch, count)| *count > 0 && canonical_combining_class(*ch) == 0);
+        .any(|(class, chars)| *class == 0 && !chars.is_empty());
     state.positions.iter().enumerate().any(|(node, rank)| {
         *rank != UNREACHABLE
             && (!graph.cluster_boundaries[node] || state.component_start || has_folded_starter)
@@ -901,40 +946,57 @@ fn pending_cluster_can_continue(state: &MatchState, graph: &NameGraph) -> bool {
     })
 }
 
-fn cluster_path_contains_units(node: usize, required: &[(char, usize)], graph: &NameGraph) -> bool {
-    let chars: Vec<char> = required.iter().map(|(ch, _)| *ch).collect();
-    let counts: Vec<usize> = required.iter().map(|(_, count)| *count).collect();
-    let mut stack = vec![(node, counts.clone())];
-    let mut seen = HashSet::from([(node, counts)]);
-    while let Some((node, counts)) = stack.pop() {
+fn cluster_path_contains_units(
+    node: usize,
+    required: &[(u8, Vec<char>)],
+    graph: &NameGraph,
+) -> bool {
+    let progress = vec![0; required.len()];
+    let mut stack = vec![(node, progress.clone())];
+    let mut seen = HashSet::from([(node, progress)]);
+    while let Some((node, progress)) = stack.pop() {
         for edge in &graph.edges[node] {
-            let mut remaining = counts.clone();
-            if let Some(index) = chars.iter().enumerate().find_map(|(index, candidate)| {
-                (*candidate == edge.unit.ch && remaining[index] > 0).then_some(index)
+            let class = canonical_combining_class(edge.unit.ch);
+            let mut successors = vec![progress.clone()];
+            if let Some(index) = required.iter().enumerate().find_map(|(index, group)| {
+                (group.0 == class
+                    && group
+                        .1
+                        .get(progress[index])
+                        .is_some_and(|ch| *ch == edge.unit.ch))
+                .then_some(index)
             }) {
-                remaining[index] -= 1;
+                let mut consumed = progress.clone();
+                consumed[index] += 1;
+                successors.push(consumed);
             }
-            if remaining.iter().all(|count| *count == 0) {
-                return true;
+            for successor in successors {
+                if required
+                    .iter()
+                    .zip(&successor)
+                    .all(|((_, chars), position)| *position == chars.len())
+                {
+                    return true;
+                }
+                let has_folded_starter = required
+                    .iter()
+                    .zip(&successor)
+                    .any(|((class, chars), position)| *class == 0 && *position < chars.len());
+                if graph.cluster_boundaries[edge.target] && !has_folded_starter {
+                    continue;
+                }
+                let next = (edge.target, successor.clone());
+                if seen.contains(&next) {
+                    continue;
+                }
+                if seen.len() == MAX_PENDING_PROBE_STATES {
+                    // This probe is only an optimization. Keeping the state lets
+                    // the bounded matcher decide safely without unbounded work.
+                    return true;
+                }
+                seen.insert(next);
+                stack.push((edge.target, successor));
             }
-            let has_folded_starter = chars
-                .iter()
-                .zip(&remaining)
-                .any(|(ch, count)| *count > 0 && canonical_combining_class(*ch) == 0);
-            if graph.cluster_boundaries[edge.target] && !has_folded_starter {
-                continue;
-            }
-            let next = (edge.target, remaining.clone());
-            if seen.contains(&next) {
-                continue;
-            }
-            if seen.len() == MAX_PENDING_PROBE_STATES {
-                // This probe is only an optimization. Keeping the state lets
-                // the bounded matcher decide safely without unbounded work.
-                return true;
-            }
-            seen.insert(next);
-            stack.push((edge.target, remaining));
         }
     }
     false
@@ -1443,6 +1505,10 @@ mod tests {
             "\u{3b1}\u{345}*.txt",
             "\u{3b1}\u{3b9}.TXT"
         ));
+        assert!(glob_matches_folded(
+            "\u{3b1}\u{345}*.txt",
+            "\u{3b1}\u{301}\u{3b9}.TXT"
+        ));
         assert!(glob_matches_folded("?.txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("[\u{fb03}].txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("?.txt", "\u{fb04}.TXT"));
@@ -1515,6 +1581,13 @@ mod tests {
         assert!(!glob_matches_folded(&combining_braces, "unrelated.rs"));
         let unreachable_combining_braces = format!("a{}.txt", "{\u{301},\u{300}}".repeat(11));
         assert!(!glob_matches_folded(&unreachable_combining_braces, "a.txt"));
+        let ordered_combining_name =
+            format!("a{}{}.TXT", "\u{301}".repeat(11), "\u{300}".repeat(11));
+        let ordered_combining_braces = format!("a{}.exe", "{\u{301},\u{300}}".repeat(11));
+        assert!(!glob_matches_folded(
+            &ordered_combining_braces,
+            &ordered_combining_name
+        ));
         let long_pending_probe = format!("\u{3b1}{}.TXT", "a".repeat(60_000));
         assert!(!glob_matches_folded(
             "\u{3b1}\u{345}*.txt",
