@@ -71,6 +71,8 @@ struct NameUnit {
     pre_unit: usize,
     pre_char: char,
     pre_total: usize,
+    pre_offset: usize,
+    canonical_rank: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +87,6 @@ struct PreFoldUnit {
 struct NameEdge {
     unit: NameUnit,
     target: usize,
-    linear: bool,
 }
 
 #[derive(Debug)]
@@ -211,9 +212,10 @@ fn linear_folded_name_graph(name: &str) -> NameGraph {
                 pre_unit: index,
                 pre_char: ch,
                 pre_total: 1,
+                pre_offset: 0,
+                canonical_rank: u16::try_from(index).unwrap_or(u16::MAX - 1),
             },
             target: index + 1,
-            linear: true,
         });
     }
     NameGraph {
@@ -415,36 +417,70 @@ fn append_pre_fold_cluster(graph: &mut NameGraph, cluster: &[PreFoldUnit]) -> Op
     );
     linear_ids[mark_start..]
         .sort_by_key(|id| canonical_combining_class(cluster[*id - cluster[0].id].ch));
+    let linear_units = folded_units(
+        &linear_ids
+            .iter()
+            .map(|id| cluster[*id - cluster[0].id].clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut canonical_units = linear_units.clone();
+    canonicalize_folded_units(&mut canonical_units);
+    let ranks: Vec<(usize, usize)> = canonical_units
+        .iter()
+        .map(|unit| (unit.pre_unit, unit.pre_offset))
+        .collect();
     let start = graph.end;
     let end = add_graph_node(graph)?;
     for variant in variants {
-        let linear = variant
-            .iter()
-            .map(|unit| unit.id)
-            .eq(linear_ids.iter().copied());
-        let mut folded = Vec::new();
-        for unit in variant {
-            let chars: Vec<char> = unit.ch.to_string().case_fold().nfd().collect();
-            let pre_total = chars.len();
-            let source_total = unit.source_char.to_string().nfd().case_fold().nfd().count();
-            for ch in chars {
-                folded.push(NameUnit {
-                    ch,
-                    separator: ch == '/',
-                    source: unit.source,
-                    source_char: unit.source_char,
-                    source_total,
-                    pre_unit: unit.id,
-                    pre_char: unit.ch,
-                    pre_total,
-                });
-            }
+        let mut folded = folded_units(&variant);
+        for unit in &mut folded {
+            let rank = ranks
+                .iter()
+                .position(|identity| *identity == (unit.pre_unit, unit.pre_offset))?;
+            unit.canonical_rank = u16::try_from(rank).ok()?;
         }
-        append_folded_sequence(graph, start, end, &folded, linear)?;
+        append_folded_sequence(graph, start, end, &folded)?;
     }
     graph.cluster_boundaries[end] = true;
     graph.end = end;
     Some(())
+}
+
+fn folded_units(variant: &[PreFoldUnit]) -> Vec<NameUnit> {
+    let mut folded = Vec::new();
+    for unit in variant {
+        let chars: Vec<char> = unit.ch.to_string().case_fold().nfd().collect();
+        let pre_total = chars.len();
+        let source_total = unit.source_char.to_string().nfd().case_fold().nfd().count();
+        for (pre_offset, ch) in chars.into_iter().enumerate() {
+            folded.push(NameUnit {
+                ch,
+                separator: ch == '/',
+                source: unit.source,
+                source_char: unit.source_char,
+                source_total,
+                pre_unit: unit.id,
+                pre_char: unit.ch,
+                pre_total,
+                pre_offset,
+                canonical_rank: 0,
+            });
+        }
+    }
+    folded
+}
+
+fn canonicalize_folded_units(units: &mut [NameUnit]) {
+    let mut start = 0;
+    while start < units.len() {
+        let mut end = start + 1;
+        while end < units.len() && canonical_combining_class(units[end].ch) != 0 {
+            end += 1;
+        }
+        let mark_start = start + usize::from(canonical_combining_class(units[start].ch) == 0);
+        units[mark_start..end].sort_by_key(|unit| canonical_combining_class(unit.ch));
+        start = end;
+    }
 }
 
 fn pre_fold_cluster_variants(cluster: &[PreFoldUnit]) -> Option<Vec<Vec<PreFoldUnit>>> {
@@ -509,7 +545,6 @@ fn append_folded_sequence(
     start: usize,
     end: usize,
     units: &[NameUnit],
-    linear: bool,
 ) -> Option<()> {
     let mut clusters = Vec::new();
     let mut cluster = Vec::new();
@@ -530,7 +565,7 @@ fn append_folded_sequence(
         } else {
             add_graph_node(graph)?
         };
-        append_canonical_cluster(graph, current, target, &cluster, linear)?;
+        append_canonical_cluster(graph, current, target, &cluster)?;
         current = target;
     }
     Some(())
@@ -541,18 +576,9 @@ fn append_canonical_cluster(
     start: usize,
     end: usize,
     cluster: &[NameUnit],
-    linear: bool,
 ) -> Option<()> {
     let cluster_variants = canonical_cluster_variants(cluster)?;
-    let mut linear_variant = cluster.to_vec();
-    let mark_start = usize::from(
-        cluster
-            .first()
-            .is_some_and(|unit| canonical_combining_class(unit.ch) == 0),
-    );
-    linear_variant[mark_start..].sort_by_key(|unit| canonical_combining_class(unit.ch));
     for variant in cluster_variants {
-        let variant_is_linear = linear && variant == linear_variant;
         let mut node = start;
         let mut units = variant.into_iter().peekable();
         while let Some(unit) = units.next() {
@@ -571,7 +597,6 @@ fn append_canonical_cluster(
                     NameEdge {
                         unit: unit.clone(),
                         target,
-                        linear: variant_is_linear,
                     },
                 )?;
                 target
@@ -581,22 +606,7 @@ fn append_canonical_cluster(
                     .iter()
                     .any(|edge| edge.unit == unit && edge.target == target)
             {
-                add_graph_edge(
-                    graph,
-                    node,
-                    NameEdge {
-                        unit,
-                        target,
-                        linear: variant_is_linear,
-                    },
-                )?;
-            } else if variant_is_linear {
-                if let Some(edge) = graph.edges[node]
-                    .iter_mut()
-                    .find(|edge| edge.unit == unit && edge.target == target)
-                {
-                    edge.linear = true;
-                }
+                add_graph_edge(graph, node, NameEdge { unit, target })?;
             }
             node = target;
         }
@@ -688,21 +698,19 @@ fn interleave_combining_groups(
 
 #[derive(Clone)]
 struct MatchState {
-    positions: Vec<u8>,
+    positions: Vec<u16>,
     component_start: bool,
     pending_stars: u8,
     pending_literal: String,
     used_wildcard: bool,
 }
 
-const PROVENANCE_CLEAN: u8 = 1;
-const PROVENANCE_REORDERED_LITERAL: u8 = 2;
-const PROVENANCE_REORDERED_WILDCARD: u8 = 4;
-const PROVENANCE_BOTH: u8 = 8;
+const UNREACHABLE: u16 = u16::MAX;
+const NO_LITERAL_RANK: u16 = 0;
 
 fn match_tokens(tokens: &[GlobToken], graph: &NameGraph, require_wildcard: bool) -> Option<bool> {
-    let mut positions = vec![0; graph.edges.len()];
-    positions[0] = PROVENANCE_CLEAN;
+    let mut positions = vec![UNREACHABLE; graph.edges.len()];
+    positions[0] = NO_LITERAL_RANK;
     let states = advance_sequence(
         tokens,
         vec![MatchState {
@@ -714,11 +722,9 @@ fn match_tokens(tokens: &[GlobToken], graph: &NameGraph, require_wildcard: bool)
         }],
         graph,
     )?;
-    Some(
-        finish_states(states, graph)?.iter().any(|state| {
-            state.positions[graph.end] != 0 && (!require_wildcard || state.used_wildcard)
-        }),
-    )
+    Some(finish_states(states, graph)?.iter().any(|state| {
+        state.positions[graph.end] != UNREACHABLE && (!require_wildcard || state.used_wildcard)
+    }))
 }
 
 fn advance_sequence(
@@ -735,11 +741,10 @@ fn advance_sequence(
                 } else {
                     1
                 };
-                for state in &mut states {
-                    state.used_wildcard = true;
-                }
                 let mut states = flush_pending_literals(states, graph)?;
                 for state in &mut states {
+                    state.used_wildcard = true;
+                    reset_literal_ranks(&mut state.positions);
                     state.pending_stars = state.pending_stars.saturating_add(count).min(2);
                 }
                 states
@@ -774,6 +779,7 @@ fn advance_nonstar(
     }
     for mut state in flush_pending_literals(states, graph)? {
         if matches!(token, GlobToken::Any | GlobToken::Class { .. }) {
+            reset_literal_ranks(&mut state.positions);
             state.component_start = false;
         }
         if state.pending_stars >= 2
@@ -813,7 +819,11 @@ fn finish_states(states: Vec<MatchState>, graph: &NameGraph) -> Option<Vec<Match
 fn merge_states(states: Vec<MatchState>) -> Option<Vec<MatchState>> {
     let mut merged: Vec<MatchState> = Vec::new();
     for state in states {
-        if !state.positions.iter().any(|position| *position != 0) {
+        if !state
+            .positions
+            .iter()
+            .any(|position| *position != UNREACHABLE)
+        {
             continue;
         }
         if let Some(existing) = merged.iter_mut().find(|existing| {
@@ -823,7 +833,7 @@ fn merge_states(states: Vec<MatchState>) -> Option<Vec<MatchState>> {
                 && existing.used_wildcard == state.used_wildcard
         }) {
             for (target, source) in existing.positions.iter_mut().zip(state.positions) {
-                *target |= source;
+                *target = (*target).min(source);
             }
         } else {
             if merged.len() == MAX_MATCH_STATES {
@@ -893,72 +903,57 @@ fn flush_pending_literal(state: &mut MatchState, graph: &NameGraph) {
     state.component_start = false;
 }
 
-fn step_provenance(
-    provenance: u8,
-    linear: bool,
-    target: usize,
-    wildcard: bool,
-    graph: &NameGraph,
-) -> u8 {
-    let mut next = 0;
-    for (bit, reordered_literal, reordered_wildcard) in [
-        (PROVENANCE_CLEAN, false, false),
-        (PROVENANCE_REORDERED_LITERAL, true, false),
-        (PROVENANCE_REORDERED_WILDCARD, false, true),
-        (PROVENANCE_BOTH, true, true),
-    ] {
-        if provenance & bit == 0 {
-            continue;
-        }
-        let reordered_literal = reordered_literal || (!wildcard && !linear);
-        let reordered_wildcard = reordered_wildcard || (wildcard && !linear);
-        if graph.cluster_boundaries[target] {
-            if !reordered_literal || reordered_wildcard {
-                next |= PROVENANCE_CLEAN;
-            }
-        } else {
-            next |= match (reordered_literal, reordered_wildcard) {
-                (false, false) => PROVENANCE_CLEAN,
-                (true, false) => PROVENANCE_REORDERED_LITERAL,
-                (false, true) => PROVENANCE_REORDERED_WILDCARD,
-                (true, true) => PROVENANCE_BOTH,
-            };
+fn reset_literal_ranks(positions: &mut [u16]) {
+    for rank in positions {
+        if *rank != UNREACHABLE {
+            *rank = NO_LITERAL_RANK;
         }
     }
-    next
 }
 
-fn advance_path(
-    mut provenance: u8,
-    steps: &[(bool, usize)],
-    wildcard: bool,
-    graph: &NameGraph,
-) -> u8 {
-    for (linear, target) in steps {
-        provenance = step_provenance(provenance, *linear, *target, wildcard, graph);
-        if provenance == 0 {
-            break;
-        }
+fn step_literal(rank: u16, edge: &NameEdge, graph: &NameGraph) -> u16 {
+    let edge_rank = edge.unit.canonical_rank.saturating_add(1);
+    if rank != NO_LITERAL_RANK && edge_rank < rank {
+        return UNREACHABLE;
     }
-    provenance
+    if graph.cluster_boundaries[edge.target] {
+        NO_LITERAL_RANK
+    } else {
+        edge_rank
+    }
 }
 
-fn literal_positions(expected: &str, positions: &[u8], graph: &NameGraph) -> Vec<u8> {
-    let mut next = vec![0; graph.edges.len()];
-    for (start, provenance) in positions.iter().copied().enumerate() {
-        if provenance != 0 {
-            for (end, provenance) in consume_literal(expected, graph, start, provenance) {
-                next[end] |= provenance;
+fn step_wildcard(rank: u16, target: usize, graph: &NameGraph) -> u16 {
+    if graph.cluster_boundaries[target] {
+        NO_LITERAL_RANK
+    } else {
+        rank
+    }
+}
+
+fn advance_wildcard_path(mut rank: u16, steps: &[usize], graph: &NameGraph) -> u16 {
+    for target in steps {
+        rank = step_wildcard(rank, *target, graph);
+    }
+    rank
+}
+
+fn literal_positions(expected: &str, positions: &[u16], graph: &NameGraph) -> Vec<u16> {
+    let mut next = vec![UNREACHABLE; graph.edges.len()];
+    for (start, rank) in positions.iter().copied().enumerate() {
+        if rank != UNREACHABLE {
+            for (end, rank) in consume_literal(expected, graph, start, rank) {
+                next[end] = next[end].min(rank);
             }
         }
     }
     next
 }
 
-fn token_positions(token: &GlobToken, positions: &[u8], graph: &NameGraph) -> Vec<u8> {
-    let mut next = vec![0; graph.edges.len()];
-    for (start, provenance) in positions.iter().copied().enumerate() {
-        if provenance == 0 || start == graph.end {
+fn token_positions(token: &GlobToken, positions: &[u16], graph: &NameGraph) -> Vec<u16> {
+    let mut next = vec![UNREACHABLE; graph.edges.len()];
+    for (start, rank) in positions.iter().copied().enumerate() {
+        if rank == UNREACHABLE || start == graph.end {
             continue;
         }
         match token {
@@ -966,21 +961,20 @@ fn token_positions(token: &GlobToken, positions: &[u8], graph: &NameGraph) -> Ve
             GlobToken::Separator => {
                 for edge in &graph.edges[start] {
                     if edge.unit.separator {
-                        next[edge.target] |=
-                            step_provenance(provenance, edge.linear, edge.target, false, graph);
+                        next[edge.target] = next[edge.target].min(step_literal(rank, edge, graph));
                     }
                 }
             }
             GlobToken::Any => {
                 for path in equivalent_character_paths(graph, start) {
-                    next[path.end] |= advance_path(provenance, &path.steps, true, graph);
+                    next[path.end] =
+                        next[path.end].min(advance_wildcard_path(rank, &path.steps, graph));
                 }
             }
             GlobToken::Class { negated, ranges } => {
-                for (end, path_provenance) in
-                    class_match_ends(*negated, ranges, graph, start, provenance)
+                for (end, path_provenance) in class_match_ends(*negated, ranges, graph, start, rank)
                 {
-                    next[end] |= path_provenance;
+                    next[end] = next[end].min(path_provenance);
                 }
             }
             GlobToken::Star | GlobToken::DoubleStar | GlobToken::Alternatives(_) => {
@@ -991,20 +985,19 @@ fn token_positions(token: &GlobToken, positions: &[u8], graph: &NameGraph) -> Ve
     next
 }
 
-fn star_positions(positions: &[u8], graph: &NameGraph, crosses_separators: bool) -> Vec<u8> {
+fn star_positions(positions: &[u16], graph: &NameGraph, crosses_separators: bool) -> Vec<u16> {
     let mut next = positions.to_vec();
     let mut stack: Vec<usize> = positions
         .iter()
         .enumerate()
-        .filter_map(|(node, reachable)| (*reachable != 0).then_some(node))
+        .filter_map(|(node, rank)| (*rank != UNREACHABLE).then_some(node))
         .collect();
     while let Some(node) = stack.pop() {
         for edge in &graph.edges[node] {
             if crosses_separators || !edge.unit.separator {
-                let provenance = step_provenance(next[node], edge.linear, edge.target, true, graph);
-                let combined = next[edge.target] | provenance;
-                if combined != next[edge.target] {
-                    next[edge.target] = combined;
+                let rank = step_wildcard(next[node], edge.target, graph);
+                if rank < next[edge.target] {
+                    next[edge.target] = rank;
                     stack.push(edge.target);
                 }
             }
@@ -1013,25 +1006,23 @@ fn star_positions(positions: &[u8], graph: &NameGraph, crosses_separators: bool)
     next
 }
 
-fn globstar_directory_positions(positions: &[u8], graph: &NameGraph) -> Vec<u8> {
+fn globstar_directory_positions(positions: &[u16], graph: &NameGraph) -> Vec<u16> {
     let mut next = positions.to_vec();
     let mut reachable = positions.to_vec();
     let mut stack: Vec<usize> = positions
         .iter()
         .enumerate()
-        .filter_map(|(node, reachable)| (*reachable != 0).then_some(node))
+        .filter_map(|(node, rank)| (*rank != UNREACHABLE).then_some(node))
         .collect();
     while let Some(node) = stack.pop() {
         for edge in &graph.edges[node] {
-            let provenance =
-                step_provenance(reachable[node], edge.linear, edge.target, true, graph);
-            let combined = reachable[edge.target] | provenance;
-            if combined != reachable[edge.target] {
-                reachable[edge.target] = combined;
+            let rank = step_wildcard(reachable[node], edge.target, graph);
+            if rank < reachable[edge.target] {
+                reachable[edge.target] = rank;
                 stack.push(edge.target);
             }
             if edge.unit.separator {
-                next[edge.target] |= provenance;
+                next[edge.target] = next[edge.target].min(rank);
             }
         }
     }
@@ -1042,26 +1033,25 @@ fn consume_literal(
     expected: &str,
     graph: &NameGraph,
     start: usize,
-    provenance: u8,
-) -> Vec<(usize, u8)> {
+    rank: u16,
+) -> Vec<(usize, u16)> {
     let expected: Vec<char> = expected.chars().collect();
-    let mut ends = Vec::new();
-    let mut stack = vec![(start, 0, provenance)];
-    while let Some((node, offset, provenance)) = stack.pop() {
+    let mut ends: Vec<(usize, u16)> = Vec::new();
+    let mut stack = vec![(start, 0, rank)];
+    while let Some((node, offset, rank)) = stack.pop() {
         if offset == expected.len() {
             if let Some((_, existing)) = ends.iter_mut().find(|(end, _)| *end == node) {
-                *existing |= provenance;
+                *existing = (*existing).min(rank);
             } else {
-                ends.push((node, provenance));
+                ends.push((node, rank));
             }
             continue;
         }
         for edge in &graph.edges[node] {
             if !edge.unit.separator && edge.unit.ch == expected[offset] {
-                let provenance =
-                    step_provenance(provenance, edge.linear, edge.target, false, graph);
-                if provenance != 0 {
-                    stack.push((edge.target, offset + 1, provenance));
+                let rank = step_literal(rank, edge, graph);
+                if rank != UNREACHABLE {
+                    stack.push((edge.target, offset + 1, rank));
                 }
             }
         }
@@ -1073,7 +1063,7 @@ fn consume_literal(
 struct CharacterPath {
     end: usize,
     units: Vec<NameUnit>,
-    steps: Vec<(bool, usize)>,
+    steps: Vec<usize>,
 }
 
 fn equivalent_character_paths(graph: &NameGraph, start: usize) -> Vec<CharacterPath> {
@@ -1087,7 +1077,7 @@ fn equivalent_character_paths(graph: &NameGraph, start: usize) -> Vec<CharacterP
             let mut path = path.clone();
             path.push(edge.unit.clone());
             let mut steps = steps.clone();
-            steps.push((edge.linear, edge.target));
+            steps.push(edge.target);
             let (endpoint, keep_scanning) = character_path_status(&path);
             if endpoint {
                 ends.push(CharacterPath {
@@ -1123,8 +1113,8 @@ fn class_match_ends(
     ranges: &[(char, char)],
     graph: &NameGraph,
     start: usize,
-    provenance: u8,
-) -> Vec<(usize, u8)> {
+    rank: u16,
+) -> Vec<(usize, u16)> {
     equivalent_character_paths(graph, start)
         .into_iter()
         .filter_map(|path| {
@@ -1152,8 +1142,8 @@ fn class_match_ends(
                         .any(|(low, high)| *low <= candidate && candidate <= *high);
                     contained != negated
                 })
-                .then(|| (path.end, advance_path(provenance, &path.steps, true, graph)))
-                .filter(|(_, provenance)| *provenance != 0)
+                .then(|| (path.end, advance_wildcard_path(rank, &path.steps, graph)))
+                .filter(|(_, rank)| *rank != UNREACHABLE)
         })
         .collect()
 }
@@ -1309,6 +1299,18 @@ mod tests {
         assert!(!glob_matches_folded(
             "*\u{3af}*.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "\u{3b1}\u{3af}*.txt",
+            "\u{3b1}\u{345}\u{301}\u{327}.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "*\u{3af}.txt",
+            "\u{3b1}\u{327}\u{301}\u{345}\u{301}.TXT"
+        ));
+        assert!(glob_matches_folded(
+            "\u{3b1}\u{345}*\u{301}.txt",
+            "\u{3b1}\u{301}\u{345}.TXT"
         ));
         assert!(glob_matches_folded(
             "\u{e1}*.txt/foo",

@@ -447,6 +447,52 @@ fn wildcard_provenance_is_finalized_at_name_cluster_boundaries() {
 }
 
 #[test]
+fn wildcard_only_authorizes_reordering_across_its_boundary() {
+    for (pattern, name) in [
+        ("\u{3b1}\u{3af}*.txt", "\u{3b1}\u{345}\u{301}\u{327}.TXT"),
+        ("*\u{3af}.txt", "\u{3b1}\u{327}\u{301}\u{345}\u{301}.TXT"),
+    ] {
+        let zip = make_zip(&[(name, b"x")]);
+
+        let dest = tempdir().unwrap();
+        Extractor::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract(Cursor::new(zip.clone()))
+            .unwrap();
+        assert_eq!(files_under(dest.path()), [name]);
+
+        let dest = tempdir().unwrap();
+        Driver::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+            .unwrap();
+        assert_eq!(files_under(dest.path()), [name]);
+    }
+
+    let pattern = "\u{3b1}\u{345}*\u{301}.txt";
+    let name = "\u{3b1}\u{301}\u{345}.TXT";
+    let zip = make_zip(&[(name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+}
+
+#[test]
 fn one_large_canonical_cluster_does_not_exclude_a_nonmatch() {
     let name = format!("a{}{}.txt", "\u{301}".repeat(5), "\u{327}".repeat(5));
     let zip = make_zip(&[(&name, b"x")]);
