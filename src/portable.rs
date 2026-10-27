@@ -61,7 +61,7 @@ enum GlobToken {
     Alternatives(Vec<Vec<GlobToken>>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NameUnit {
     ch: char,
     separator: bool,
@@ -121,7 +121,12 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
             EquivalentMatch::NoMatch
         };
     }
-    let Some(graph) = canonical_name_graph(name) else {
+    let graph = if literal_only(&tokens) {
+        Some(linear_folded_name_graph(name))
+    } else {
+        canonical_name_graph(name)
+    };
+    let Some(graph) = graph else {
         return EquivalentMatch::Indeterminate;
     };
     match match_tokens(&tokens, &graph) {
@@ -129,6 +134,16 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
         Some(false) => EquivalentMatch::NoMatch,
         None => EquivalentMatch::Indeterminate,
     }
+}
+
+fn literal_only(tokens: &[GlobToken]) -> bool {
+    tokens.iter().all(|token| match token {
+        GlobToken::Literal(_) | GlobToken::Separator => true,
+        GlobToken::Alternatives(alternatives) => alternatives
+            .iter()
+            .all(|alternative| literal_only(alternative)),
+        _ => false,
+    })
 }
 
 fn literal_pattern(tokens: &[GlobToken]) -> Option<String> {
@@ -141,6 +156,31 @@ fn literal_pattern(tokens: &[GlobToken]) -> Option<String> {
         }
     }
     Some(literal)
+}
+
+fn linear_folded_name_graph(name: &str) -> NameGraph {
+    let chars: Vec<char> = fold_for_glob(name).chars().collect();
+    let mut edges = vec![Vec::new(); chars.len() + 1];
+    for (index, ch) in chars.iter().copied().enumerate() {
+        edges[index].push(NameEdge {
+            unit: NameUnit {
+                ch,
+                separator: ch == '/',
+                source: index,
+                source_char: ch,
+                source_total: 1,
+                pre_unit: index,
+                pre_char: ch,
+                pre_total: 1,
+            },
+            target: index + 1,
+        });
+    }
+    NameGraph {
+        edge_count: chars.len(),
+        end: chars.len(),
+        edges,
+    }
 }
 
 fn tokenize_glob(pattern: &str) -> Option<Vec<GlobToken>> {
@@ -453,10 +493,30 @@ fn append_canonical_cluster(
         while let Some(unit) = units.next() {
             let target = if units.peek().is_none() {
                 end
+            } else if let Some(target) = graph.edges[node]
+                .iter()
+                .find_map(|edge| (edge.unit == unit && edge.target != end).then_some(edge.target))
+            {
+                target
             } else {
-                add_graph_node(graph)?
+                let target = add_graph_node(graph)?;
+                add_graph_edge(
+                    graph,
+                    node,
+                    NameEdge {
+                        unit: unit.clone(),
+                        target,
+                    },
+                )?;
+                target
             };
-            add_graph_edge(graph, node, NameEdge { unit, target })?;
+            if units.peek().is_none()
+                && !graph.edges[node]
+                    .iter()
+                    .any(|edge| edge.unit == unit && edge.target == target)
+            {
+                add_graph_edge(graph, node, NameEdge { unit, target })?;
+            }
             node = target;
         }
     }
@@ -1034,6 +1094,10 @@ mod tests {
             "\u{3b1}\u{3af}.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
         ));
+        assert!(!glob_matches_folded(
+            "{\u{3b1}\u{3af},x}.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
         assert!(glob_matches_folded("[A-z].txt", "_.TXT"));
         assert!(glob_matches_folded("[A].txt", "a.TXT"));
         assert!(glob_matches_folded("[A-Z].dat", "q.DAT"));
@@ -1118,6 +1182,8 @@ mod tests {
             "*.exe",
             &format!("{}.txt", "\u{1ead}".repeat(9))
         ));
+        let shared_cluster = format!("a{}{}.txt", "\u{301}".repeat(5), "\u{327}".repeat(5));
+        assert!(!glob_matches_folded("*.exe", &shared_cluster));
         let combining_braces = format!("a{}.txt", "{\u{301},\u{300}}".repeat(20));
         assert!(!glob_matches_folded(&combining_braces, "unrelated.rs"));
         let duplicate_braces = format!("{{{}}}.txt", vec!["a"; 1_025].join(","));
