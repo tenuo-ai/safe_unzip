@@ -137,6 +137,11 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
         Some(false) => {}
         None => return EquivalentMatch::Indeterminate,
     }
+    if let Some(suffix) = ascii_literal_suffix(&tokens) {
+        if !fold_for_glob(name).ends_with(&suffix) {
+            return EquivalentMatch::NoMatch;
+        }
+    }
     if literal_only(&tokens) {
         return EquivalentMatch::NoMatch;
     }
@@ -193,6 +198,22 @@ fn literal_only(tokens: &[GlobToken]) -> bool {
             .all(|alternative| literal_only(alternative)),
         _ => false,
     })
+}
+
+fn ascii_literal_suffix(tokens: &[GlobToken]) -> Option<String> {
+    let mut parts = Vec::new();
+    for token in tokens.iter().rev() {
+        match token {
+            GlobToken::Literal(literal) if literal.is_ascii() => parts.push(literal.as_str()),
+            GlobToken::Separator => parts.push("/"),
+            _ => break,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    Some(parts.concat().to_ascii_lowercase())
 }
 
 fn literal_pattern(tokens: &[GlobToken]) -> Option<String> {
@@ -452,7 +473,8 @@ fn iota_spelling_demand(tokens: &[GlobToken]) -> usize {
                 .chars()
                 .filter(|ch| char_decomposes_to_iota_subscript(*ch))
                 .count(),
-            GlobToken::Any | GlobToken::Star | GlobToken::DoubleStar => 1,
+            GlobToken::Any => 1,
+            GlobToken::Star | GlobToken::DoubleStar => MAX_EQUIVALENT_PRE_FOLD_SPELLINGS,
             GlobToken::Class { negated, ranges } => usize::from(
                 *negated
                     || ranges

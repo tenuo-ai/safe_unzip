@@ -322,7 +322,10 @@ fn wildcard_iota_origin_spellings_are_excluded_by_both_apis() {
 
 #[test]
 fn star_iota_origin_spellings_are_excluded_by_both_apis() {
-    let names = ["\u{3b1}\u{345}\u{301}.txt", "\u{3b1}\u{301}\u{3b9}.TXT"];
+    let names = [
+        "\u{3b1}\u{345}\u{345}\u{301}.txt",
+        "\u{3b1}\u{301}\u{3b9}\u{3b9}.TXT",
+    ];
     let zip = make_zip(&[(names[0], b"x"), (names[1], b"y")]);
     let pattern = "\u{3b1}*\u{301}.txt";
 
@@ -341,6 +344,30 @@ fn star_iota_origin_spellings_are_excluded_by_both_apis() {
         .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
         .unwrap();
     assert!(files_under(dest.path()).is_empty());
+}
+
+#[test]
+fn ascii_suffix_prunes_large_iota_spelling_nonmatches() {
+    let name = format!("{}.txt", "\u{3b9}".repeat(23));
+    let zip = make_zip(&[(&name, b"x")]);
+
+    for pattern in ["**/*.exe", "?*.exe"] {
+        let dest = tempdir().unwrap();
+        Extractor::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract(Cursor::new(zip.clone()))
+            .unwrap();
+        assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+
+        let dest = tempdir().unwrap();
+        Driver::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract_zip(ZipAdapter::new(Cursor::new(zip.clone())).unwrap())
+            .unwrap();
+        assert_eq!(files_under(dest.path()), std::slice::from_ref(&name));
+    }
 }
 
 #[test]
