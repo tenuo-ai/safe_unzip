@@ -112,6 +112,9 @@ const MAX_MATCH_STATES: usize = 1_024;
 /// range (`[A-f]`), turn a literal hyphen into a range, or split one Unicode
 /// class member into several code points.
 fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
+    if !name_within_equivalence_limits(name) {
+        return EquivalentMatch::Indeterminate;
+    }
     let Some(tokens) = tokenize_glob(pattern) else {
         return EquivalentMatch::NoMatch;
     };
@@ -139,6 +142,33 @@ fn equivalent_glob_match(pattern: &str, name: &str) -> EquivalentMatch {
         Some(false) => EquivalentMatch::NoMatch,
         None => EquivalentMatch::Indeterminate,
     }
+}
+
+fn name_within_equivalence_limits(name: &str) -> bool {
+    let mut marks_in_cluster = 0;
+    let mut folded_units = 0;
+    for source_char in name.chars() {
+        let source = source_char.to_string();
+        for ch in source.nfd() {
+            if canonical_combining_class(ch) == 0 {
+                marks_in_cluster = 0;
+            } else {
+                marks_in_cluster += 1;
+                if marks_in_cluster > MAX_COMBINING_MARKS_PER_CLUSTER {
+                    return false;
+                }
+            }
+
+            let decomposed = ch.to_string();
+            for _ in decomposed.case_fold().nfd() {
+                folded_units += 1;
+                if folded_units >= MAX_NAME_GRAPH_ITEMS {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn literal_only(tokens: &[GlobToken]) -> bool {
@@ -1342,6 +1372,24 @@ mod tests {
         let too_many_graph_nodes =
             "a\u{301}\u{301}\u{301}\u{301}\u{301}\u{327}\u{327}\u{327}\u{327}\u{327}".repeat(3_000);
         assert!(canonical_name_graph(&too_many_graph_nodes).is_none());
+    }
+
+    #[test]
+    fn equivalence_limits_are_checked_before_matching() {
+        let too_many_marks = format!(
+            "a{}.TXT",
+            "\u{301}".repeat(MAX_COMBINING_MARKS_PER_CLUSTER + 1)
+        );
+        assert_eq!(
+            equivalent_glob_match("?.txt", &too_many_marks),
+            EquivalentMatch::Indeterminate
+        );
+
+        let oversized = "a".repeat(MAX_NAME_GRAPH_ITEMS);
+        assert_eq!(
+            equivalent_glob_match("*.txt", &oversized),
+            EquivalentMatch::Indeterminate
+        );
     }
 
     #[test]
