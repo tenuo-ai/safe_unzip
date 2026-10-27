@@ -94,6 +94,29 @@ fn driver_exclude_matches_equivalent_names() {
 }
 
 #[test]
+fn expanded_case_fold_scalars_are_excluded_by_both_apis() {
+    for pattern in ["?.txt", "[\u{df}].txt"] {
+        let zip = make_zip(&[("\u{df}.TXT", b"x")]);
+
+        let dest = tempdir().unwrap();
+        Extractor::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract(Cursor::new(zip.clone()))
+            .unwrap();
+        assert!(files_under(dest.path()).is_empty(), "Extractor: {pattern}");
+
+        let dest = tempdir().unwrap();
+        Driver::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+            .unwrap();
+        assert!(files_under(dest.path()).is_empty(), "Driver: {pattern}");
+    }
+}
+
+#[test]
 fn include_and_only_stay_exact() {
     let zip = make_zip(&[("README.md", b"a"), ("readme.md", b"b")]);
     let dest = tempdir().unwrap();
