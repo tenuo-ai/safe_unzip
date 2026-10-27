@@ -396,30 +396,43 @@ fn canonical_name_graph(name: &str) -> Option<NameGraph> {
 
 fn canonical_name_graphs(name: &str, tokens: &[GlobToken]) -> Option<Vec<NameGraph>> {
     let original = canonical_name_graph(name)?;
-    if !tokens_need_iota_spellings(tokens) {
-        return Some(vec![original]);
-    }
     let mut total_edges = original.edge_count;
     let mut graphs = vec![original];
-    let folded: Vec<char> = fold_for_glob(name).chars().collect();
-    let iota_indexes: Vec<usize> = folded
+    let folded = fold_for_glob(name);
+    if !folded.contains('\u{3b9}') {
+        return Some(graphs);
+    }
+    let spelling_demand = iota_spelling_demand(tokens);
+    if spelling_demand == 0 {
+        return Some(graphs);
+    }
+    let original: Vec<char> = name.chars().collect();
+    let iota_indexes: Vec<usize> = original
         .iter()
         .enumerate()
-        .filter_map(|(index, ch)| (*ch == '\u{3b9}').then_some(index))
+        .filter_map(|(index, ch)| (fold_for_glob(&ch.to_string()) == "\u{3b9}").then_some(index))
         .collect();
-    let spelling_count = 1usize.checked_shl(u32::try_from(iota_indexes.len()).ok()?)?;
-    if spelling_count > MAX_EQUIVALENT_PRE_FOLD_SPELLINGS {
-        return None;
-    }
-    for mask in 1..spelling_count {
-        let mut spelling = folded.clone();
-        for (bit, index) in iota_indexes.iter().enumerate() {
-            if mask & (1 << bit) != 0 {
-                spelling[*index] = '\u{345}';
+    let mut replacements: Vec<Vec<usize>> = vec![Vec::new()];
+    for index in iota_indexes {
+        let existing = replacements.len();
+        for replacement in 0..existing {
+            if replacements[replacement].len() < spelling_demand {
+                if replacements.len() == MAX_EQUIVALENT_PRE_FOLD_SPELLINGS {
+                    return None;
+                }
+                let mut replacement = replacements[replacement].clone();
+                replacement.push(index);
+                replacements.push(replacement);
             }
         }
+    }
+    for replacement in replacements.into_iter().skip(1) {
+        let mut spelling = original.clone();
+        for index in replacement {
+            spelling[index] = '\u{345}';
+        }
         let spelling: String = spelling.into_iter().collect();
-        if fold_for_glob(&spelling).chars().ne(folded.iter().copied()) {
+        if fold_for_glob(&spelling) != folded {
             continue;
         }
         let graph = canonical_name_graph(&spelling)?;
@@ -432,17 +445,47 @@ fn canonical_name_graphs(name: &str, tokens: &[GlobToken]) -> Option<Vec<NameGra
     Some(graphs)
 }
 
-fn tokens_need_iota_spellings(tokens: &[GlobToken]) -> bool {
-    tokens.iter().any(|token| match token {
-        GlobToken::Literal(literal) => literal.chars().any(char_decomposes_to_iota_subscript),
-        GlobToken::Class { ranges, .. } => ranges
-            .iter()
-            .any(|(low, high)| (*low..=*high).any(char_decomposes_to_iota_subscript)),
-        GlobToken::Alternatives(alternatives) => alternatives
-            .iter()
-            .any(|alternative| tokens_need_iota_spellings(alternative)),
-        GlobToken::Separator | GlobToken::Any | GlobToken::Star | GlobToken::DoubleStar => false,
+fn iota_spelling_demand(tokens: &[GlobToken]) -> usize {
+    tokens.iter().fold(0usize, |demand, token| {
+        demand.saturating_add(match token {
+            GlobToken::Literal(literal) => literal
+                .chars()
+                .filter(|ch| char_decomposes_to_iota_subscript(*ch))
+                .count(),
+            GlobToken::Any => 1,
+            GlobToken::Class { negated, ranges } => usize::from(
+                *negated
+                    || ranges
+                        .iter()
+                        .any(|(low, high)| range_contains_iota_subscript(*low, *high)),
+            ),
+            GlobToken::Alternatives(alternatives) => alternatives
+                .iter()
+                .map(|alternative| iota_spelling_demand(alternative))
+                .max()
+                .unwrap_or(0),
+            GlobToken::Separator | GlobToken::Star | GlobToken::DoubleStar => 0,
+        })
     })
+}
+
+fn range_contains_iota_subscript(low: char, high: char) -> bool {
+    const DECOMPOSITION_RANGES: &[(char, char)] = &[
+        ('\u{345}', '\u{345}'),
+        ('\u{1f80}', '\u{1faf}'),
+        ('\u{1fb2}', '\u{1fb4}'),
+        ('\u{1fb7}', '\u{1fb7}'),
+        ('\u{1fbc}', '\u{1fbc}'),
+        ('\u{1fc2}', '\u{1fc4}'),
+        ('\u{1fc7}', '\u{1fc7}'),
+        ('\u{1fcc}', '\u{1fcc}'),
+        ('\u{1ff2}', '\u{1ff4}'),
+        ('\u{1ff7}', '\u{1ff7}'),
+        ('\u{1ffc}', '\u{1ffc}'),
+    ];
+    DECOMPOSITION_RANGES
+        .iter()
+        .any(|(range_low, range_high)| low <= *range_high && high >= *range_low)
 }
 
 fn char_decomposes_to_iota_subscript(ch: char) -> bool {

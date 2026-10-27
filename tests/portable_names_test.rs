@@ -297,6 +297,76 @@ fn invalid_iota_subscript_spelling_does_not_exclude() {
 }
 
 #[test]
+fn wildcard_iota_origin_spellings_are_excluded_by_both_apis() {
+    let name = "\u{3b1}\u{301}\u{3b9}.TXT";
+    let zip = make_zip(&[(name, b"x")]);
+
+    for pattern in ["\u{3b1}?\u{301}.txt", "\u{3b1}[!\u{301}]*.txt"] {
+        let dest = tempdir().unwrap();
+        Extractor::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract(Cursor::new(zip.clone()))
+            .unwrap();
+        assert!(files_under(dest.path()).is_empty());
+
+        let dest = tempdir().unwrap();
+        Driver::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract_zip(ZipAdapter::new(Cursor::new(zip.clone())).unwrap())
+            .unwrap();
+        assert!(files_under(dest.path()).is_empty());
+    }
+}
+
+#[test]
+fn synthesized_spellings_preserve_scalar_provenance() {
+    let name = "\u{3b1}\u{301}\u{3b9}/\u{df}.TXT";
+    let zip = make_zip(&[(name, b"x")]);
+    let pattern = "\u{3b1}\u{345}*/?.txt";
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert!(files_under(dest.path()).is_empty());
+}
+
+#[test]
+fn astral_class_ranges_do_not_scan_every_scalar_per_entry() {
+    let name = "README.md";
+    let zip = make_zip(&[(name, b"x")]);
+    let pattern = "[\u{10000}-\u{10ffff}]*.txt";
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+}
+
+#[test]
 fn branching_pending_probe_does_not_exclude_a_nonmatch() {
     let pattern = "\u{3b1}\u{345}*.txt";
     let name = format!("\u{3b1}{}.TXT", "a\u{301}\u{327}".repeat(16));
