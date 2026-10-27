@@ -493,6 +493,30 @@ fn wildcard_only_authorizes_reordering_across_its_boundary() {
 }
 
 #[test]
+fn character_classes_preserve_canonical_fold_nonmatches() {
+    let name = "\u{3b1}\u{345}\u{301}.TXT";
+    for pattern in ["\u{3b1}[\u{3af}].txt", "*[\u{3af}]*.txt"] {
+        let zip = make_zip(&[(name, b"x")]);
+
+        let dest = tempdir().unwrap();
+        Extractor::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract(Cursor::new(zip.clone()))
+            .unwrap();
+        assert_eq!(files_under(dest.path()), [name], "Extractor: {pattern}");
+
+        let dest = tempdir().unwrap();
+        Driver::new(dest.path())
+            .unwrap()
+            .exclude_glob(&[pattern])
+            .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+            .unwrap();
+        assert_eq!(files_under(dest.path()), [name], "Driver: {pattern}");
+    }
+}
+
+#[test]
 fn one_large_canonical_cluster_does_not_exclude_a_nonmatch() {
     let name = format!("a{}{}.txt", "\u{301}".repeat(5), "\u{327}".repeat(5));
     let zip = make_zip(&[(&name, b"x")]);

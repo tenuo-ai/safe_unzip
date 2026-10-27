@@ -912,11 +912,15 @@ fn reset_literal_ranks(positions: &mut [u16]) {
 }
 
 fn step_literal(rank: u16, edge: &NameEdge, graph: &NameGraph) -> u16 {
-    let edge_rank = edge.unit.canonical_rank.saturating_add(1);
+    step_literal_unit(rank, &edge.unit, edge.target, graph)
+}
+
+fn step_literal_unit(rank: u16, unit: &NameUnit, target: usize, graph: &NameGraph) -> u16 {
+    let edge_rank = unit.canonical_rank.saturating_add(1);
     if rank != NO_LITERAL_RANK && edge_rank < rank {
         return UNREACHABLE;
     }
-    if graph.cluster_boundaries[edge.target] {
+    if graph.cluster_boundaries[target] {
         NO_LITERAL_RANK
     } else {
         edge_rank
@@ -936,6 +940,17 @@ fn advance_wildcard_path(mut rank: u16, steps: &[usize], graph: &NameGraph) -> u
         rank = step_wildcard(rank, *target, graph);
     }
     rank
+}
+
+fn class_path_is_canonical(path: &CharacterPath, graph: &NameGraph) -> bool {
+    let mut rank = NO_LITERAL_RANK;
+    for (unit, target) in path.units.iter().zip(&path.steps) {
+        rank = step_literal_unit(rank, unit, *target, graph);
+        if rank == UNREACHABLE {
+            return false;
+        }
+    }
+    true
 }
 
 fn literal_positions(expected: &str, positions: &[u16], graph: &NameGraph) -> Vec<u16> {
@@ -1118,6 +1133,9 @@ fn class_match_ends(
     equivalent_character_paths(graph, start)
         .into_iter()
         .filter_map(|path| {
+            if !class_path_is_canonical(&path, graph) {
+                return None;
+            }
             let text: String = path.units.iter().map(|unit| unit.ch).collect();
             let mut candidates = equivalent_class_chars(&text);
             if let Some(original) = original_scalar(&path.units, 0, path.units.len()) {
@@ -1334,6 +1352,18 @@ mod tests {
         assert!(glob_matches_folded("?.txt", "I\u{307}.TXT"));
         assert!(glob_matches_folded("[\u{130}].txt", "I\u{307}.TXT"));
         assert!(glob_matches_folded("[\u{130}]*.txt", "I\u{327}\u{307}.TXT"));
+        assert!(!glob_matches_folded(
+            "\u{3b1}[\u{3af}].txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "*[\u{3af}]*.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
+        assert!(glob_matches_folded(
+            "\u{3b1}[\u{3b9}]\u{301}.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
         assert!(glob_matches_folded("?.txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("[\u{fb03}].txt", "\u{fb03}.TXT"));
         assert!(glob_matches_folded("?.txt", "\u{fb04}.TXT"));
