@@ -196,32 +196,36 @@ fn literal_pattern(tokens: &[GlobToken]) -> Option<String> {
 }
 
 fn linear_folded_name_graph(name: &str) -> NameGraph {
-    let chars: Vec<char> = fold_for_glob(name).chars().collect();
-    let mut edges = vec![Vec::new(); chars.len() + 1];
-    let mut cluster_boundaries = vec![false; chars.len() + 1];
+    let mut units = Vec::new();
+    let mut boundary_indexes = Vec::new();
+    for mut cluster in
+        pre_fold_clusters(name).expect("name limits are checked before graph construction")
+    {
+        cluster.sort_by_key(|unit| canonical_combining_class(unit.ch));
+        let mut folded = folded_units(&cluster);
+        canonicalize_folded_units(&mut folded);
+        for (rank, unit) in folded.iter_mut().enumerate() {
+            unit.canonical_rank = u16::try_from(rank).unwrap_or(u16::MAX - 1);
+        }
+        units.extend(folded);
+        boundary_indexes.push(units.len());
+    }
+    let mut edges = vec![Vec::new(); units.len() + 1];
+    let mut cluster_boundaries = vec![false; units.len() + 1];
     cluster_boundaries[0] = true;
-    cluster_boundaries[chars.len()] = true;
-    for (index, ch) in chars.iter().copied().enumerate() {
+    for boundary in boundary_indexes {
+        cluster_boundaries[boundary] = true;
+    }
+    for (index, unit) in units.into_iter().enumerate() {
         edges[index].push(NameEdge {
-            unit: NameUnit {
-                ch,
-                separator: ch == '/',
-                source: index,
-                source_char: ch,
-                source_total: 1,
-                pre_unit: index,
-                pre_char: ch,
-                pre_total: 1,
-                pre_offset: 0,
-                canonical_rank: u16::try_from(index).unwrap_or(u16::MAX - 1),
-            },
+            unit,
             target: index + 1,
         });
     }
     NameGraph {
         cluster_boundaries,
-        edge_count: chars.len(),
-        end: chars.len(),
+        edge_count: edges.len().saturating_sub(1),
+        end: edges.len().saturating_sub(1),
         edges,
     }
 }
@@ -868,7 +872,49 @@ fn advance_literal(
         }
         advanced.push(state);
     }
+    advanced.retain(|state| pending_cluster_can_continue(state, graph));
     merge_states(advanced)
+}
+
+fn pending_cluster_can_continue(state: &MatchState, graph: &NameGraph) -> bool {
+    if state.pending_literal.is_empty() {
+        return true;
+    }
+    let mut required: Vec<(char, usize)> = Vec::new();
+    for ch in fold_for_glob(&state.pending_literal).chars() {
+        if let Some((_, count)) = required.iter_mut().find(|(candidate, _)| *candidate == ch) {
+            *count += 1;
+        } else {
+            required.push((ch, 1));
+        }
+    }
+    state.positions.iter().enumerate().any(|(node, rank)| {
+        *rank != UNREACHABLE
+            && (!graph.cluster_boundaries[node] || state.component_start)
+            && cluster_path_contains_units(node, &required, graph)
+    })
+}
+
+fn cluster_path_contains_units(node: usize, required: &[(char, usize)], graph: &NameGraph) -> bool {
+    if required.iter().all(|(_, count)| *count == 0) {
+        return true;
+    }
+    for edge in &graph.edges[node] {
+        let mut remaining = required.to_vec();
+        if let Some((_, count)) = remaining
+            .iter_mut()
+            .find(|(candidate, count)| *candidate == edge.unit.ch && *count > 0)
+        {
+            *count -= 1;
+        }
+        if remaining.iter().all(|(_, count)| *count == 0)
+            || (!graph.cluster_boundaries[edge.target]
+                && cluster_path_contains_units(edge.target, &remaining, graph))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn flush_pending_literals(states: Vec<MatchState>, graph: &NameGraph) -> Option<Vec<MatchState>> {
@@ -982,8 +1028,10 @@ fn token_positions(token: &GlobToken, positions: &[u16], graph: &NameGraph) -> V
             }
             GlobToken::Any => {
                 for path in equivalent_character_paths(graph, start) {
-                    next[path.end] =
-                        next[path.end].min(advance_wildcard_path(rank, &path.steps, graph));
+                    if class_path_is_canonical(&path, graph) {
+                        next[path.end] =
+                            next[path.end].min(advance_wildcard_path(rank, &path.steps, graph));
+                    }
                 }
             }
             GlobToken::Class { negated, ranges } => {
@@ -1360,6 +1408,10 @@ mod tests {
             "*[\u{3af}]*.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
         ));
+        assert!(!glob_matches_folded(
+            "\u{3b1}?.txt",
+            "\u{3b1}\u{345}\u{301}.TXT"
+        ));
         assert!(glob_matches_folded(
             "\u{3b1}[\u{3b9}]\u{301}.txt",
             "\u{3b1}\u{345}\u{301}.TXT"
@@ -1434,6 +1486,8 @@ mod tests {
         assert!(!glob_matches_folded("*.exe", &shared_cluster));
         let combining_braces = format!("a{}.txt", "{\u{301},\u{300}}".repeat(20));
         assert!(!glob_matches_folded(&combining_braces, "unrelated.rs"));
+        let unreachable_combining_braces = format!("a{}.txt", "{\u{301},\u{300}}".repeat(11));
+        assert!(!glob_matches_folded(&unreachable_combining_braces, "a.txt"));
         let duplicate_braces = format!("{{{}}}.txt", vec!["a"; 1_025].join(","));
         assert!(!glob_matches_folded(&duplicate_braces, "another.rs"));
     }

@@ -242,6 +242,28 @@ fn combining_mark_braces_do_not_exclude_a_nonmatch() {
 }
 
 #[test]
+fn unreachable_combining_braces_do_not_exhaust_match_states() {
+    let pattern = format!("a{}.txt", "{\u{301},\u{300}}".repeat(11));
+    let zip = make_zip(&[("a.txt", b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), ["a.txt"]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[&pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), ["a.txt"]);
+}
+
+#[test]
 fn interleaved_prefold_composition_is_excluded_by_both_apis() {
     let pattern = "[\u{130}]*.txt";
     let zip = make_zip(&[("I\u{327}\u{307}.TXT", b"x")]);
@@ -514,6 +536,29 @@ fn character_classes_preserve_canonical_fold_nonmatches() {
             .unwrap();
         assert_eq!(files_under(dest.path()), [name], "Driver: {pattern}");
     }
+}
+
+#[test]
+fn single_character_wildcards_preserve_canonical_fold_nonmatches() {
+    let pattern = "\u{3b1}?.txt";
+    let name = "\u{3b1}\u{345}\u{301}.TXT";
+    let zip = make_zip(&[(name, b"x")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&[pattern])
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), [name]);
 }
 
 #[test]
