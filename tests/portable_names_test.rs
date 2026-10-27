@@ -378,6 +378,32 @@ fn wildcard_does_not_relax_a_different_path_component() {
 }
 
 #[test]
+fn wildcard_only_relaxes_the_cluster_it_touches() {
+    let patterns = ["\u{3b1}\u{3af}-*.txt", "*x\u{3b1}\u{3af}.txt"];
+    let names = [
+        "x\u{3b1}\u{345}\u{301}.TXT",
+        "\u{3b1}\u{345}\u{301}-note.TXT",
+    ];
+    let zip = make_zip(&[(names[0], b"x"), (names[1], b"y")]);
+
+    let dest = tempdir().unwrap();
+    Extractor::new(dest.path())
+        .unwrap()
+        .exclude_glob(&patterns)
+        .extract(Cursor::new(zip.clone()))
+        .unwrap();
+    assert_eq!(files_under(dest.path()), names);
+
+    let dest = tempdir().unwrap();
+    Driver::new(dest.path())
+        .unwrap()
+        .exclude_glob(&patterns)
+        .extract_zip(ZipAdapter::new(Cursor::new(zip)).unwrap())
+        .unwrap();
+    assert_eq!(files_under(dest.path()), names);
+}
+
+#[test]
 fn one_large_canonical_cluster_does_not_exclude_a_nonmatch() {
     let name = format!("a{}{}.txt", "\u{301}".repeat(5), "\u{327}".repeat(5));
     let zip = make_zip(&[(&name, b"x")]);

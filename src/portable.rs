@@ -686,7 +686,7 @@ struct MatchState {
     pending_stars: u8,
     pending_literal: String,
     used_wildcard: bool,
-    component_used_wildcard: bool,
+    cluster_used_wildcard: bool,
 }
 
 fn match_tokens(tokens: &[GlobToken], graph: &NameGraph, require_wildcard: bool) -> Option<bool> {
@@ -701,7 +701,7 @@ fn match_tokens(tokens: &[GlobToken], graph: &NameGraph, require_wildcard: bool)
             pending_stars: 0,
             pending_literal: String::new(),
             used_wildcard: false,
-            component_used_wildcard: false,
+            cluster_used_wildcard: false,
         }],
         graph,
     )?;
@@ -728,7 +728,7 @@ fn advance_sequence(
                 };
                 for state in &mut states {
                     state.used_wildcard = true;
-                    state.component_used_wildcard = true;
+                    state.cluster_used_wildcard = true;
                 }
                 let mut states = flush_pending_literals(states, graph)?;
                 for state in &mut states {
@@ -762,7 +762,7 @@ fn advance_nonstar(
     if matches!(token, GlobToken::Any | GlobToken::Class { .. }) {
         for state in &mut states {
             state.used_wildcard = true;
-            state.component_used_wildcard = true;
+            state.cluster_used_wildcard = true;
         }
     }
     for mut state in flush_pending_literals(states, graph)? {
@@ -777,7 +777,7 @@ fn advance_nonstar(
             state.linear_positions = state.positions.clone();
             state.pending_stars = 0;
             state.component_start = true;
-            state.component_used_wildcard = false;
+            state.cluster_used_wildcard = false;
             advanced.push(state);
             continue;
         }
@@ -786,13 +786,13 @@ fn advance_nonstar(
             state.linear_positions = star_positions(&state.linear_positions, graph, false, true);
             state.pending_stars = 0;
         }
-        if matches!(token, GlobToken::Separator) && !state.component_used_wildcard {
-            state.positions.clone_from(&state.linear_positions);
+        if matches!(token, GlobToken::Separator) {
+            finish_cluster(&mut state);
         }
         state.positions = token_positions(token, &state.positions, graph, false);
         if matches!(token, GlobToken::Separator) {
             state.linear_positions = state.positions.clone();
-            state.component_used_wildcard = false;
+            state.cluster_used_wildcard = false;
         } else {
             state.linear_positions = token_positions(token, &state.linear_positions, graph, true);
         }
@@ -812,9 +812,7 @@ fn finish_states(states: Vec<MatchState>, graph: &NameGraph) -> Option<Vec<Match
                 star_positions(&state.linear_positions, graph, crosses_separators, true);
             state.pending_stars = 0;
         }
-        if !state.component_used_wildcard {
-            state.positions.clone_from(&state.linear_positions);
-        }
+        finish_cluster(&mut state);
         finished.push(state);
     }
     merge_states(finished)
@@ -831,7 +829,7 @@ fn merge_states(states: Vec<MatchState>) -> Option<Vec<MatchState>> {
                 && existing.pending_stars == state.pending_stars
                 && existing.pending_literal == state.pending_literal
                 && existing.used_wildcard == state.used_wildcard
-                && existing.component_used_wildcard == state.component_used_wildcard
+                && existing.cluster_used_wildcard == state.cluster_used_wildcard
         }) {
             for (target, source) in existing.positions.iter_mut().zip(state.positions) {
                 *target |= source;
@@ -890,6 +888,7 @@ fn flush_pending_literals(states: Vec<MatchState>, graph: &NameGraph) -> Option<
 }
 
 fn consume_literal_starter(state: &mut MatchState, starter: char, graph: &NameGraph) {
+    finish_cluster(state);
     let folded = fold_for_glob(&starter.to_string());
     let split = folded
         .char_indices()
@@ -902,6 +901,14 @@ fn consume_literal_starter(state: &mut MatchState, starter: char, graph: &NameGr
         state.component_start = false;
     }
     state.pending_literal.push_str(&folded[split..]);
+}
+
+fn finish_cluster(state: &mut MatchState) {
+    if !state.cluster_used_wildcard {
+        state.positions.clone_from(&state.linear_positions);
+    }
+    state.linear_positions.clone_from(&state.positions);
+    state.cluster_used_wildcard = false;
 }
 
 fn flush_pending_literal(state: &mut MatchState, graph: &NameGraph) {
@@ -1260,6 +1267,14 @@ mod tests {
         assert!(!glob_matches_folded(
             "*/\u{3b1}\u{3af}.txt",
             "dir/\u{3b1}\u{345}\u{301}.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "\u{3b1}\u{3af}-*.txt",
+            "\u{3b1}\u{345}\u{301}-note.TXT"
+        ));
+        assert!(!glob_matches_folded(
+            "*x\u{3b1}\u{3af}.txt",
+            "x\u{3b1}\u{345}\u{301}.TXT"
         ));
         assert!(glob_matches_folded(
             "\u{e1}*.txt/foo",
